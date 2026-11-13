@@ -1,0 +1,15 @@
+# Default Caddyfile for caddy-email
+# This is moved to /etc/caddy/Caddyfile at build time
+
+{
+    admin off
+    mta {
+        spool_dir /var/lib/caddy/spool
+    }
+}
+
+:80 {
+    route /sendmail/* {
+        sendmail
+    }
+}
