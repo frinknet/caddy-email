@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -12,8 +13,18 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
 
-	"github.com/example/caddy-email/pkg/shared"
+	"github.com/frinknet/caddy-email/pkg/shared"
 )
+
+// notifyWorkers is the number of concurrent webhook POSTers. Four is
+// enough to keep a normal event stream drained without a slow endpoint
+// blocking anything else; each worker holds at most one in-flight POST.
+const notifyWorkers = 4
+
+// notifyBuffer is the maximum number of events queued for webhook
+// delivery before new events are dropped. Sized to absorb a burst from
+// a full concurrency batch.
+const notifyBuffer = 1024
 
 func init() {
 	caddy.RegisterModule(new(MTA))
@@ -37,13 +48,19 @@ type MTA struct {
 	CommandTimeout   caddy.Duration `json:"command_timeout,omitempty"`
 	NotifyURL        string         `json:"notify_url,omitempty"`
 	NotifySecret     string         `json:"notify_secret,omitempty"`
+	MxCacheTTL       caddy.Duration `json:"mx_cache_ttl,omitempty"`
+	DKIM             *DKIMConfig    `json:"dkim,omitempty"`
 
 	log          *zap.Logger
 	stopCh       chan struct{}
 	wg           sync.WaitGroup
 	notifyClient *http.Client
+	notifyCh     chan shared.DeliveryEvent
 	mxSem        map[string]chan struct{}
 	mxSemMu      sync.Mutex
+	globalSem    chan struct{}
+	mxCache      map[string]mxCacheEntry
+	mxCacheMu    sync.RWMutex
 }
 
 func (*MTA) CaddyModule() caddy.ModuleInfo {
@@ -65,10 +82,21 @@ func (m *MTA) Provision(ctx caddy.Context) error {
 			return err
 		}
 	}
+	m.notifyCh = make(chan shared.DeliveryEvent, notifyBuffer)
 	if m.NotifyURL != "" {
 		m.notifyClient = &http.Client{Timeout: 10 * time.Second}
 	}
 	m.mxSem = make(map[string]chan struct{})
+	m.globalSem = make(chan struct{}, m.Concurrency)
+	m.mxCache = make(map[string]mxCacheEntry)
+
+	if m.DKIM != nil && m.DKIM.PrivateKey != "" {
+		key, err := parseDKIMKey(m.DKIM.PrivateKey)
+		if err != nil {
+			return fmt.Errorf("mta: dkim: %w", err)
+		}
+		m.DKIM.parsedKey = key
+	}
 	return nil
 }
 
@@ -123,24 +151,45 @@ func (m *MTA) applyDefaults() {
 	if m.CommandTimeout == 0 {
 		m.CommandTimeout = caddy.Duration(5 * time.Minute)
 	}
+	if m.MxCacheTTL == 0 {
+		m.MxCacheTTL = caddy.Duration(5 * time.Minute)
+	}
 }
 
 func (m *MTA) Validate() error {
 	if m.SettleDelay < 0 {
 		return fmt.Errorf("mta: settle_delay must be >= 0")
 	}
-	if m.NotifyURL != "" && m.NotifySecret == "" {
-		m.log.Warn("mta: notify_url set without notify_secret; events will be unsigned")
+	if m.NotifyURL != "" {
+		u, err := url.Parse(m.NotifyURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("mta: invalid notify_url %q", m.NotifyURL)
+		}
+		if m.NotifySecret == "" {
+			m.log.Warn("mta: notify_url set without notify_secret; events will be unsigned")
+		}
+	}
+	if m.NotifyURL == "" && m.NotifySecret != "" {
+		m.log.Warn("mta: notify_secret set without notify_url; no events will be sent")
 	}
 	return nil
 }
 
 func (m *MTA) Start() error {
 	m.stopCh = make(chan struct{})
+
 	recovered := shared.RecoverActive(m.SpoolDir, 2*time.Duration(m.ConnectTimeout))
 	if recovered > 0 {
 		m.log.Info("mta: recovered active messages", zap.Int("count", recovered))
 	}
+
+	if m.NotifyURL != "" {
+		for i := 0; i < notifyWorkers; i++ {
+			m.wg.Add(1)
+			go m.notifyWorker()
+		}
+	}
+
 	m.wg.Add(1)
 	go m.loop()
 	return nil
@@ -156,6 +205,3 @@ func (m *MTA) Stop() error {
 func (m *MTA) Enqueue(_ context.Context, env *shared.Envelope, raw []byte) (string, error) {
 	return shared.Enqueue(m.SpoolDir, env, raw)
 }
-
-// Ensure context is used
-var _ = context.Background

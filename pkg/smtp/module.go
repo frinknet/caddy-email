@@ -1,7 +1,7 @@
 package smtp
 
 import (
-	"context"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"os"
@@ -26,18 +26,26 @@ type SMTP struct {
 	wg     sync.WaitGroup
 }
 
+// ListenerConfig describes one receive-only SMTP listener.
+//
+// The listener's only job is transport + parse + handoff. It accepts
+// unauthenticated SMTP from anyone who can reach the port, parses the
+// message, synthesizes an *http.Request, and runs the route. All policy
+// decisions belong to the route, which signals acceptance/rejection via
+// HTTP status — mapStatus translates that back to an SMTP reply code.
 type ListenerConfig struct {
-	Port             int                `json:"port,omitempty"`
-	Hostname         string             `json:"hostname,omitempty"`
-	MaxMessageSize   int64              `json:"max_message_size,omitempty"`
-	MaxRecipients    int                `json:"max_recipients,omitempty"`
-	MaxConnections   int                `json:"max_connections,omitempty"`
-	PermitMyNetworks []string           `json:"permit_mynetworks,omitempty"`
-	DeliverTimeout   caddy.Duration     `json:"deliver_timeout,omitempty"`
-	DeliverSecret    string             `json:"deliver_secret,omitempty"`
-	TLS              string             `json:"tls,omitempty"`  // "starttls" | "off"
-	Auth             string             `json:"auth,omitempty"` // "required" | "optional" | "off"
-	Route            *caddyhttp.Subroute `json:"-"`
+	Port           int                 `json:"port,omitempty"`
+	Hostname       string              `json:"hostname,omitempty"`
+	MaxMessageSize int64               `json:"max_message_size,omitempty"`
+	MaxRecipients  int                 `json:"max_recipients,omitempty"`
+	MaxConnections int                 `json:"max_connections,omitempty"`
+	DeliverTimeout caddy.Duration      `json:"deliver_timeout,omitempty"`
+	TLS            string              `json:"tls,omitempty"` // "starttls" | "off"
+	TLSCertFile    string              `json:"tls_cert_file,omitempty"`
+	TLSKeyFile     string              `json:"tls_key_file,omitempty"`
+	Route          *caddyhttp.Subroute `json:"-"`
+
+	tlsCert *tls.Certificate
 }
 
 func (*SMTP) CaddyModule() caddy.ModuleInfo {
@@ -70,21 +78,14 @@ func (s *SMTP) Provision(ctx caddy.Context) error {
 			lc.DeliverTimeout = caddy.Duration(30 * time.Second)
 		}
 		if lc.TLS == "" {
-			if lc.Port == 587 {
-				lc.TLS = "starttls"
-			} else {
-				lc.TLS = "off"
-			}
+			lc.TLS = "off"
 		}
-		if lc.Auth == "" {
-			if lc.Port == 587 {
-				lc.Auth = "required"
-			} else {
-				lc.Auth = "off"
+		if lc.TLS == "starttls" && lc.TLSCertFile != "" && lc.TLSKeyFile != "" {
+			cert, err := tls.LoadX509KeyPair(lc.TLSCertFile, lc.TLSKeyFile)
+			if err != nil {
+				return fmt.Errorf("smtp :%d load tls cert: %w", lc.Port, err)
 			}
-		}
-		if lc.Port == 25 && len(lc.PermitMyNetworks) == 0 {
-			lc.PermitMyNetworks = []string{"127.0.0.0/8", "::1/128"}
+			lc.tlsCert = &cert
 		}
 		if lc.Route != nil {
 			if err := lc.Route.Provision(ctx); err != nil {
@@ -100,8 +101,11 @@ func (s *SMTP) Validate() error {
 		if lc.Port == 0 {
 			return fmt.Errorf("smtp: listener port required")
 		}
-		if lc.Port == 25 && len(lc.PermitMyNetworks) == 0 {
-			return fmt.Errorf("smtp :25 requires explicit permit_mynetworks (open relay)")
+		if lc.TLS != "" && lc.TLS != "starttls" && lc.TLS != "off" {
+			return fmt.Errorf("smtp :%d invalid tls value %q (must be \"starttls\" or \"off\")", lc.Port, lc.TLS)
+		}
+		if lc.TLS == "starttls" && (lc.TLSCertFile == "" || lc.TLSKeyFile == "") {
+			return fmt.Errorf("smtp :%d tls=starttls requires tls_cert_file and tls_key_file", lc.Port)
 		}
 	}
 	return nil
@@ -149,7 +153,6 @@ func (s *SMTP) serve(lc *ListenerConfig, ln net.Listener) {
 		go func(c net.Conn) {
 			defer func() { <-sem }()
 			defer c.Close()
-			// Enforce idle timeout
 			timeout := time.Duration(lc.DeliverTimeout)
 			if timeout > 0 {
 				c.SetDeadline(time.Now().Add(timeout))
@@ -158,5 +161,3 @@ func (s *SMTP) serve(lc *ListenerConfig, ln net.Listener) {
 		}(conn)
 	}
 }
-
-var _ = context.Background

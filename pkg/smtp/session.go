@@ -3,6 +3,7 @@ package smtp
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"fmt"
 	"net"
 	"strings"
@@ -17,11 +18,10 @@ type session struct {
 	writer *bufio.Writer
 	repl   *caddy.Replacer
 
-	helo     string
-	from     string
-	rcpts    []string
-	tlsOn    bool
-	authUser string
+	helo  string
+	from  string
+	rcpts []string
+	tlsOn bool
 }
 
 func newSession(lc *ListenerConfig, conn net.Conn) *session {
@@ -79,10 +79,8 @@ func (s *session) run() {
 		case "QUIT":
 			s.reply(221, "Bye")
 			return
-		case "AUTH":
-			s.handleAuth(args)
 		case "STARTTLS":
-			s.reply(502, "STARTTLS not implemented")
+			s.handleSTARTTLS()
 		default:
 			s.reply(500, "Unknown command")
 		}
@@ -93,28 +91,17 @@ func (s *session) handleEHLO(args string) {
 	s.helo = args
 	s.repl.Set("smtp.helo", args)
 
-	// Check if client IP is from a permitted network
-	trusted := s.isTrustedIP()
-
 	var caps []string
 	caps = append(caps, s.lc.Hostname)
 	if s.lc.MaxMessageSize > 0 {
 		caps = append(caps, fmt.Sprintf("SIZE %d", s.lc.MaxMessageSize))
 	}
-	if s.lc.Auth != "off" {
-		caps = append(caps, "AUTH PLAIN")
-	}
 	caps = append(caps, "PIPELINING")
+	caps = append(caps, "ENHANCEDSTATUSCODES")
 	if s.lc.TLS == "starttls" && !s.tlsOn {
 		caps = append(caps, "STARTTLS")
 	}
-	if s.lc.Route != nil && !trusted {
-		// Only advertise mail submission if client is trusted or authenticated
-		// When a route is configured, we accept mail; without it, we reject
-		caps = append(caps, "ENHANCEDSTATUSCODES")
-	}
 
-	// Multi-line EHLO response
 	for i, cap := range caps {
 		if i == len(caps)-1 {
 			s.replyf("250 %s", cap)
@@ -125,61 +112,12 @@ func (s *session) handleEHLO(args string) {
 }
 
 func (s *session) handleHELO(args string) {
-	if s.lc.TLS == "starttls" && !s.tlsOn {
-		s.reply(550, "STARTTLS required")
-		return
-	}
-	if s.lc.Auth == "required" && s.authUser == "" {
-		s.reply(550, "Authentication required")
-		return
-	}
 	s.helo = args
 	s.repl.Set("smtp.helo", args)
 	s.reply(250, s.lc.Hostname)
 }
 
-func (s *session) isTrustedIP() bool {
-	if len(s.lc.PermitMyNetworks) == 0 {
-		return false
-	}
-	remoteIP := s.conn.RemoteAddr().String()
-	host, _, err := net.SplitHostPort(remoteIP)
-	if err != nil {
-		host = remoteIP
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	for _, cidr := range s.lc.PermitMyNetworks {
-		_, cidrNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			continue
-		}
-		if cidrNet.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
 func (s *session) handleMail(args string) {
-	// Enforce auth if required
-	if s.lc.Auth == "required" && s.authUser == "" {
-		s.reply(530, "Authentication required")
-		return
-	}
-	// Enforce TLS if required
-	if s.lc.TLS == "starttls" && !s.tlsOn {
-		s.reply(530, "STARTTLS required")
-		return
-	}
-	// Check if this is a relay attempt (port 25, untrusted)
-	if s.lc.Port == 25 && !s.isTrustedIP() && s.lc.Route == nil {
-		s.reply(550, "Relay not permitted")
-		return
-	}
-
 	from := extractAngle(args)
 	if from == "" && !strings.Contains(strings.ToUpper(args), "FROM:<>") {
 		s.reply(501, "Syntax: MAIL FROM:<addr>")
@@ -239,31 +177,28 @@ func (s *session) handleData() {
 	s.rcpts = nil
 }
 
-func (s *session) handleAuth(args string) {
-	if s.lc.Auth == "off" {
-		s.reply(502, "AUTH not available")
+func (s *session) handleSTARTTLS() {
+	if s.lc.TLS != "starttls" {
+		s.reply(502, "STARTTLS not available")
 		return
 	}
-	// TODO: real SASL. For v1 accept any credentials and set authUser.
-	parts := strings.Fields(args)
-	if len(parts) < 1 {
-		s.reply(501, "AUTH <mechanism>")
+	if s.lc.tlsCert == nil {
+		s.reply(502, "STARTTLS not configured")
 		return
 	}
-	if strings.EqualFold(parts[0], "PLAIN") {
-		s.reply(334, "")
-		resp, err := s.reader.ReadString('\n')
-		if err != nil {
-			return
-		}
-		_ = resp
-		// TODO decode base64, split \0user\0pass
-		s.authUser = "anonymous"
-		s.repl.Set("smtp.auth_user", s.authUser)
-		s.reply(235, "Authentication successful")
+	s.reply(220, "Ready to start TLS")
+	tlsConn := tls.Server(s.conn, &tls.Config{
+		Certificates: []tls.Certificate{*s.lc.tlsCert},
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		s.reply(550, "TLS handshake failed")
 		return
 	}
-	s.reply(504, "Unsupported mechanism")
+	s.conn = tlsConn
+	s.reader = bufio.NewReader(tlsConn)
+	s.writer = bufio.NewWriter(tlsConn)
+	s.tlsOn = true
+	s.repl.Set("smtp.tls", "true")
 }
 
 func splitCmd(line string) (string, string) {

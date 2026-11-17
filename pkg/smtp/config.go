@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -61,8 +60,6 @@ func parseSMTPOption(d *caddyfile.Dispenser, _ any) (any, error) {
 					return nil, err
 				}
 				lc.MaxConnections = n
-			case "permit_mynetworks":
-				lc.PermitMyNetworks = append(lc.PermitMyNetworks, d.RemainingArgs()...)
 			case "deliver_timeout":
 				if !d.NextArg() {
 					return nil, d.ArgErr()
@@ -72,16 +69,16 @@ func parseSMTPOption(d *caddyfile.Dispenser, _ any) (any, error) {
 					return nil, err
 				}
 				lc.DeliverTimeout = caddy.Duration(dur)
-			case "deliver_secret":
-				if !d.AllArgs(&lc.DeliverSecret) {
-					return nil, d.ArgErr()
-				}
 			case "tls":
 				if !d.AllArgs(&lc.TLS) {
 					return nil, d.ArgErr()
 				}
-			case "auth":
-				if !d.AllArgs(&lc.Auth) {
+			case "tls_cert_file":
+				if !d.AllArgs(&lc.TLSCertFile) {
+					return nil, d.ArgErr()
+				}
+			case "tls_key_file":
+				if !d.AllArgs(&lc.TLSKeyFile) {
 					return nil, d.ArgErr()
 				}
 			case "route":
@@ -93,11 +90,6 @@ func parseSMTPOption(d *caddyfile.Dispenser, _ any) (any, error) {
 					return nil, err
 				}
 				lc.Route = sr.(*caddyhttp.Subroute)
-			case "reject_from", "reject_rcpt":
-				// TODO: parse reject rule + pattern + code + text
-				if !d.NextBlock(1) {
-					continue
-				}
 			default:
 				return nil, d.Errf("unknown smtp option: %s", d.Val())
 			}

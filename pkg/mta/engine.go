@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/example/caddy-email/pkg/shared"
+	"github.com/frinknet/caddy-email/pkg/shared"
 	"go.uber.org/zap"
 )
 
@@ -44,12 +44,14 @@ func (m *MTA) tick() {
 		return
 	}
 
-	groups := groupByMX(claimed, m.log)
+	groups := m.groupByMX(claimed, m.log)
 	var wg sync.WaitGroup
 	for mx, batch := range groups {
 		wg.Add(1)
 		go func(host string, jobs []*shared.Job) {
 			defer wg.Done()
+			m.globalSem <- struct{}{}
+			defer func() { <-m.globalSem }()
 			m.withMXSem(host, func() {
 				for _, j := range jobs {
 					m.deliverOne(host, j)

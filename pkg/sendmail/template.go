@@ -8,7 +8,7 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
 
-	"github.com/example/caddy-email/pkg/shared"
+	"github.com/frinknet/caddy-email/pkg/shared"
 )
 
 func init() {

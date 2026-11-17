@@ -6,13 +6,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/example/caddy-email/pkg/shared"
 )
 
 // dispatch synthesizes an *http.Request for the message, runs it through

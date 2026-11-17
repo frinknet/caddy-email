@@ -45,13 +45,18 @@ type Job struct {
 }
 
 // DeliveryEvent is POSTed to notify_url after delivery/deferral/bounce.
+//
+// NextAt is a pointer so that delivered/bounced events omit the field
+// entirely. A non-pointer time.Time always serializes (as the zero value),
+// even with omitempty, because Go's encoding/json never considers a struct
+// "empty".
 type DeliveryEvent struct {
-	QueueID  string    `json:"queue_id"`
-	Event    string    `json:"event"` // "delivered" | "deferred" | "bounced"
-	Rcpt     []string  `json:"rcpt"`
-	Attempts int       `json:"attempts"`
-	Message  string    `json:"message,omitempty"`
-	NextAt   time.Time `json:"next_at,omitempty"`
+	QueueID  string     `json:"queue_id"`
+	Event    string     `json:"event"` // "delivered" | "deferred" | "bounced"
+	Rcpt     []string   `json:"rcpt"`
+	Attempts int        `json:"attempts"`
+	Message  string     `json:"message,omitempty"`
+	NextAt   *time.Time `json:"next_at,omitempty"`
 }
 
 // Enqueuer is the contract sendmail uses against the mta app.

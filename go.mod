@@ -1,4 +1,4 @@
-module github.com/example/caddy-email
+module github.com/frinknet/caddy-email
 
 go 1.22
 

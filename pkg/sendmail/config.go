@@ -24,6 +24,10 @@ func (s *Sendmail) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if !d.AllArgs(&s.DefaultFrom) {
 					return d.ArgErr()
 				}
+			case "default_subject":
+				if !d.AllArgs(&s.DefaultSubject) {
+					return d.ArgErr()
+				}
 			case "max_body_size":
 				if !d.NextArg() {
 					return d.ArgErr()
@@ -35,8 +39,6 @@ func (s *Sendmail) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				s.MaxBodySize = sz
 			case "allowed_from":
 				s.AllowedFrom = append(s.AllowedFrom, d.RemainingArgs()...)
-			case "require_auth":
-				s.RequireAuth = true
 			default:
 				return d.Errf("unknown sendmail option: %s", d.Val())
 			}
