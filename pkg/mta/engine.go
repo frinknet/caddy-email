@@ -44,8 +44,21 @@ func (m *MTA) tick() {
 		jobs = m.splitMultiDomain(jobs)
 	}
 
-	// Claim each before grouping.
-	claimed := jobs[:0]
+	// Mark every candidate in flight before claiming. Claim only renames the
+	// qf, preserving its (possibly old) mtime, so the janitor's recovery would
+	// otherwise be free to requeue a job between the claim and a later mark.
+	for _, j := range jobs {
+		m.markInFlight(j.ID)
+	}
+	defer func() {
+		for _, j := range jobs {
+			m.clearInFlight(j.ID)
+		}
+	}()
+
+	// Claim each before grouping. claimed is a fresh slice (not jobs[:0]) so
+	// the deferred clear sees every marked id.
+	claimed := make([]*shared.Job, 0, len(jobs))
 	for _, j := range jobs {
 		if err := shared.Claim(m.SpoolDir, j.ID); err != nil {
 			continue

@@ -20,6 +20,15 @@ import (
 // deliver the notification itself never generates another one.
 const metaDSN = "dsn"
 
+// bareAddress returns the addr-spec of s, or s unchanged when it cannot be
+// parsed. It keeps a display name off the SMTP envelope.
+func bareAddress(s string) string {
+	if a, ok := shared.NormalizeAddress(s); ok {
+		return a
+	}
+	return s
+}
+
 // deliverOne attempts delivery of one job, trying each MX host in preference
 // order until one completes a connection and greeting. On success the queue
 // files are unlinked and a "delivered" event is POSTed. On failure the job is
@@ -38,6 +47,14 @@ func (m *MTA) deliverOne(hosts []string, j *shared.Job) {
 	if err != nil {
 		m.failPermanent(j, "read df: "+err.Error())
 		return
+	}
+
+	// Envelope addresses are normalized to bare addr-specs at intake. Do it
+	// again here so a qf written by an older build or another producer cannot
+	// corrupt MAIL FROM or the DKIM d= tag with a display name.
+	j.From = bareAddress(j.From)
+	for i, rcpt := range j.To {
+		j.To[i] = bareAddress(rcpt)
 	}
 
 	// DKIM signs into a transient copy; the spooled df stays raw so a retry

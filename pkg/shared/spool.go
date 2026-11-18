@@ -344,8 +344,8 @@ func moveCorruptFrom(spoolDir, state, id string) {
 	src := filepath.Join(spoolDir, state)
 	cor := filepath.Join(spoolDir, StateCorrupt)
 	os.MkdirAll(cor, 0700)
-	os.Rename(filepath.Join(src, "qf"+id), filepath.Join(cor, "qf"+id))
 	os.Rename(filepath.Join(src, "df"+id), filepath.Join(cor, "df"+id))
+	os.Rename(filepath.Join(src, "qf"+id), filepath.Join(cor, "qf"+id))
 }
 
 // Claim moves both files into active/.
@@ -355,11 +355,14 @@ func Claim(spoolDir, id string) error {
 	if err := os.MkdirAll(act, 0700); err != nil {
 		return err
 	}
-	if err := os.Rename(filepath.Join(inc, "qf"+id), filepath.Join(act, "qf"+id)); err != nil {
+	// df before qf: qf is the commit marker, so a crash between the two
+	// renames leaves df in active/ with qf still in incoming/ (recoverable),
+	// never a committed qf without its body.
+	if err := os.Rename(filepath.Join(inc, "df"+id), filepath.Join(act, "df"+id)); err != nil {
 		return err
 	}
-	if err := os.Rename(filepath.Join(inc, "df"+id), filepath.Join(act, "df"+id)); err != nil {
-		os.Rename(filepath.Join(act, "qf"+id), filepath.Join(inc, "qf"+id))
+	if err := os.Rename(filepath.Join(inc, "qf"+id), filepath.Join(act, "qf"+id)); err != nil {
+		os.Rename(filepath.Join(act, "df"+id), filepath.Join(inc, "df"+id))
 		return err
 	}
 	return nil
@@ -394,10 +397,14 @@ func Defer(spoolDir, id string, next time.Time, attempts int, lastErr string) er
 	if err := atomicWrite(qfPath+".tmp", qfPath, encodeQFJob(j, lastErr), 0600); err != nil {
 		return err
 	}
-	if err := os.Rename(qfPath, filepath.Join(def, "qf"+id)); err != nil {
+	if err := os.Rename(filepath.Join(act, "df"+id), filepath.Join(def, "df"+id)); err != nil {
 		return err
 	}
-	return os.Rename(filepath.Join(act, "df"+id), filepath.Join(def, "df"+id))
+	if err := os.Rename(qfPath, filepath.Join(def, "qf"+id)); err != nil {
+		os.Rename(filepath.Join(def, "df"+id), filepath.Join(act, "df"+id))
+		return err
+	}
+	return nil
 }
 
 // Bounce moves both files to bounce/.
@@ -405,13 +412,17 @@ func Bounce(spoolDir, id string) {
 	act := filepath.Join(spoolDir, StateActive)
 	bnc := filepath.Join(spoolDir, StateBounce)
 	os.MkdirAll(bnc, 0700)
+	if err := os.Rename(filepath.Join(act, "df"+id), filepath.Join(bnc, "df"+id)); err != nil {
+		return
+	}
 	os.Rename(filepath.Join(act, "qf"+id), filepath.Join(bnc, "qf"+id))
-	os.Rename(filepath.Join(act, "df"+id), filepath.Join(bnc, "df"+id))
 }
 
-// RecoverActive is called on Start: any file in active/ older than cutoff
-// is moved back to incoming/ (assumed crash).
-func RecoverActive(spoolDir string, cutoff time.Duration) int {
+// RecoverActive moves active/ entries older than cutoff back to incoming/,
+// which is what a crash leaves behind. skip, when non-nil, protects jobs this
+// process is currently delivering so a periodic pass cannot requeue a live
+// delivery. It returns the number of jobs recovered.
+func RecoverActive(spoolDir string, cutoff time.Duration, skip func(string) bool) int {
 	act := filepath.Join(spoolDir, StateActive)
 	inc := filepath.Join(spoolDir, StateIncoming)
 	entries, err := os.ReadDir(act)
@@ -430,8 +441,81 @@ func RecoverActive(spoolDir string, cutoff time.Duration) int {
 			continue
 		}
 		id := name[2:]
-		if err := os.Rename(filepath.Join(act, "qf"+id), filepath.Join(inc, "qf"+id)); err == nil {
-			os.Rename(filepath.Join(act, "df"+id), filepath.Join(inc, "df"+id))
+		if skip != nil && skip(id) {
+			continue
+		}
+		// df before qf, with rollback, so a crash mid-move never strands a
+		// committed qf without its body.
+		if err := os.Rename(filepath.Join(act, "df"+id), filepath.Join(inc, "df"+id)); err != nil {
+			continue
+		}
+		if err := os.Rename(filepath.Join(act, "qf"+id), filepath.Join(inc, "qf"+id)); err != nil {
+			os.Rename(filepath.Join(inc, "df"+id), filepath.Join(act, "df"+id))
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// ReconcileSpool repairs files left by a crash between the two renames of a
+// transition. Because every transition moves df before qf, a split pair means
+// df already reached its destination, so the qf is moved to join it. A df with
+// no qf is an orphan left by an interrupted Enqueue and is removed; a qf with
+// no df cannot be delivered and is quarantined in corrupt/. It returns the
+// number of repairs made.
+func ReconcileSpool(spoolDir string) int {
+	states := []string{
+		StateIncoming, StateActive, StateDeferred,
+		StateBounce, StateCorrupt, StateHold,
+	}
+	qfAt := make(map[string]string)
+	dfAt := make(map[string]string)
+	for _, st := range states {
+		entries, err := os.ReadDir(filepath.Join(spoolDir, st))
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasSuffix(name, ".tmp") || len(name) < 3 {
+				continue
+			}
+			switch name[:2] {
+			case "qf":
+				qfAt[name[2:]] = st
+			case "df":
+				dfAt[name[2:]] = st
+			}
+		}
+	}
+
+	n := 0
+	// Unify split pairs by moving qf to wherever df already landed.
+	for id, dst := range dfAt {
+		src, ok := qfAt[id]
+		if !ok || src == dst {
+			continue
+		}
+		if err := os.Rename(filepath.Join(spoolDir, src, "qf"+id), filepath.Join(spoolDir, dst, "qf"+id)); err == nil {
+			n++
+		}
+	}
+	// Orphan bodies: a df with no qf anywhere is an interrupted Enqueue.
+	for id, st := range dfAt {
+		if _, ok := qfAt[id]; !ok {
+			os.Remove(filepath.Join(spoolDir, st, "df"+id))
+			n++
+		}
+	}
+	// Committed qf with no body: nothing can deliver it, so quarantine it.
+	for id, st := range qfAt {
+		if _, ok := dfAt[id]; ok || st == StateCorrupt {
+			continue
+		}
+		cor := filepath.Join(spoolDir, StateCorrupt)
+		os.MkdirAll(cor, 0700)
+		if err := os.Rename(filepath.Join(spoolDir, st, "qf"+id), filepath.Join(cor, "qf"+id)); err == nil {
 			n++
 		}
 	}

@@ -74,6 +74,11 @@ type MTA struct {
 	mxCache      map[string]mxCacheEntry
 	mxCacheMu    sync.RWMutex
 
+	// inFlight tracks job IDs currently being delivered, so the janitor's
+	// crash recovery never requeues a live delivery.
+	inFlightMu sync.Mutex
+	inFlight   map[string]struct{}
+
 	// smtpPort is the port dialed on MX hosts. It is 25 in production and
 	// overridable only from tests.
 	smtpPort   string
@@ -260,8 +265,15 @@ func (m *MTA) Start() error {
 	if size, err := shared.SpoolSize(m.SpoolDir); err == nil {
 		m.spoolBytes.Store(size)
 	}
-
-	recovered := shared.RecoverActive(m.SpoolDir, 2*time.Duration(m.ConnectTimeout))
+	if m.inFlight == nil {
+		m.inFlight = make(map[string]struct{})
+	}
+	// Heal any pair a crash split before recovering active jobs, so a stranded
+	// df is reunited with its qf instead of being skipped.
+	if n := shared.ReconcileSpool(m.SpoolDir); n > 0 {
+		m.logger().Info("mta: reconciled spool", zap.Int("repairs", n))
+	}
+	recovered := m.recoverActive(2 * time.Duration(m.ConnectTimeout))
 	if recovered > 0 {
 		m.logger().Info("mta: recovered active messages", zap.Int("count", recovered))
 	}
@@ -311,6 +323,31 @@ func (m *MTA) Stop() error {
 	return nil
 }
 
+// recoverActive requeues stale active/ jobs, skipping any delivery that is
+// still in flight in this process.
+func (m *MTA) recoverActive(cutoff time.Duration) int {
+	return shared.RecoverActive(m.SpoolDir, cutoff, m.isInFlight)
+}
+
+func (m *MTA) isInFlight(id string) bool {
+	m.inFlightMu.Lock()
+	defer m.inFlightMu.Unlock()
+	_, ok := m.inFlight[id]
+	return ok
+}
+
+func (m *MTA) markInFlight(id string) {
+	m.inFlightMu.Lock()
+	m.inFlight[id] = struct{}{}
+	m.inFlightMu.Unlock()
+}
+
+func (m *MTA) clearInFlight(id string) {
+	m.inFlightMu.Lock()
+	delete(m.inFlight, id)
+	m.inFlightMu.Unlock()
+}
+
 // janitor periodically recomputes the spool size for quota accounting and
 // prunes expired bounce archives so they cannot grow without bound.
 func (m *MTA) janitor() {
@@ -324,6 +361,15 @@ func (m *MTA) janitor() {
 		case <-ticker.C:
 			if size, err := shared.SpoolSize(m.SpoolDir); err == nil {
 				m.spoolBytes.Store(size)
+			}
+			// Repair crash-split pairs and requeue stale active jobs on every
+			// pass: a job claimed moments before a crash is initially too
+			// recent to recover, so it must get a second chance later.
+			if n := shared.ReconcileSpool(m.SpoolDir); n > 0 {
+				m.logger().Info("mta: reconciled spool", zap.Int("repairs", n))
+			}
+			if n := m.recoverActive(2 * time.Duration(m.ConnectTimeout)); n > 0 {
+				m.logger().Info("mta: recovered stale active messages", zap.Int("count", n))
 			}
 			if r := time.Duration(m.BounceRetention); r > 0 {
 				if n := shared.PruneBounce(m.SpoolDir, time.Now().Add(-r)); n > 0 {

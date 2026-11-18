@@ -205,17 +205,23 @@ func splitAddressList(v string) []string {
 }
 
 // validateEnvelope rejects envelope addresses that are empty, unparseable, or
-// carry CR/LF. Both the message headers and the SMTP envelope are built from
-// these values, so a bad address must fail the request rather than reach the
-// wire.
+// carry CR/LF, then rewrites them to their bare addr-spec form. Both the message
+// headers and the SMTP envelope are built from these values, so a bad address
+// must fail the request rather than reach the wire, and a display name
+// ("Name <a@b>") must not leak into MAIL/RCPT or the DKIM d= tag. The message
+// headers keep the original values, so the display name is still shown.
 func validateEnvelope(env *shared.Envelope) error {
-	if !shared.ValidAddress(env.From) {
+	from, ok := shared.NormalizeAddress(env.From)
+	if !ok {
 		return fmt.Errorf("invalid from address %q", env.From)
 	}
-	for _, rcpt := range env.To {
-		if !shared.ValidAddress(rcpt) {
+	env.From = from
+	for i, rcpt := range env.To {
+		addr, ok := shared.NormalizeAddress(rcpt)
+		if !ok {
 			return fmt.Errorf("invalid recipient address %q", rcpt)
 		}
+		env.To[i] = addr
 	}
 	return nil
 }

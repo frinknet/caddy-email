@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 FROM caddy:2.11.9-builder-alpine AS build
 
-RUN apk add --no-cache ca-certificates tzdata curl
+RUN apk add --no-cache ca-certificates tzdata curl upx
 
 ARG TARGETARCH
 RUN case "${TARGETARCH}" in \
@@ -81,7 +81,9 @@ COPY             www                       /srv/www
 # populate toybox
 RUN ["/bin/toybox", "sh", "-c", "cd /bin && for i in $(./toybox); do if [ \"$i\" != toybox ]; then ./toybox ln -s toybox \"$i\"; fi; done && test -L /bin/sh && test -L /bin/ls"]
 RUN mkdir -p /etc/caddy /var/lib/caddy /var/cache/caddy /tmp && chmod 1777 /tmp
-RUN mv /srv/www/Caddyfile /etc/caddy/Caddyfile
+
+# Caddy loads ./Caddyfile from its working directory, so the shipped default
+# config stays at /srv/www/Caddyfile; mount over it to run your own.
 
 ENV PATH="/bin:/usr/bin:/usr/local/bin"
 ENV XDG_CONFIG_HOME="/etc/caddy"
@@ -90,8 +92,10 @@ ENV XDG_CACHE_HOME="/var/cache/caddy"
 ENV TMPDIR="/tmp"
 ENV HOME="/tmp"
 
+# The default config disables the admin endpoint, so the probe checks the
+# serving listener instead of the admin API.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD /bin/toybox wget -O /dev/null -T 2 http://127.0.0.1:2019/config/ >/dev/null 2>&1
+    CMD /bin/nc -w 2 127.0.0.1 80 </dev/null >/dev/null 2>&1
 
 EXPOSE 80 443 443/udp
 

@@ -1,5 +1,5 @@
 # Default Caddyfile for caddy-email
-# This is moved to /etc/caddy/Caddyfile at build time
+# Caddy loads this as ./Caddyfile from /srv/www; mount over it to customize
 
 {
     admin off

@@ -43,7 +43,7 @@ type ListenerConfig struct {
 	TLS            string              `json:"tls,omitempty"` // "starttls" | "off"
 	TLSCertFile    string              `json:"tls_cert_file,omitempty"`
 	TLSKeyFile     string              `json:"tls_key_file,omitempty"`
-	Route          *caddyhttp.Subroute `json:"-"`
+	Route          *caddyhttp.Subroute `json:"route,omitempty"`
 
 	tlsCert *tls.Certificate
 }

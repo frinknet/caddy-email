@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
@@ -23,17 +22,22 @@ func (s *session) dispatch(raw []byte) {
 		return
 	}
 
-	req := s.buildRequest(raw)
 	rrw := newSmtpResponseWriter()
+	req := s.buildRequest(raw)
 
-	ctx := context.WithValue(req.Context(), caddy.ReplacerCtxKey, s.repl)
+	// Handlers expect the context Caddy normally attaches to a request:
+	// replacer, vars (client IP, trusted proxy), and a server. Without these
+	// reverse_proxy panics on the missing variables.
+	req = caddyhttp.PrepareRequest(req, s.repl, rrw, nil)
+	ctx := context.WithValue(req.Context(), caddyhttp.ServerCtxKey, new(caddyhttp.Server))
 	req = req.WithContext(ctx)
+	caddyhttp.SetVar(ctx, caddyhttp.ClientIPVarKey, s.conn.RemoteAddr().String())
 
 	// Apply deliver timeout
 	timeout := time.Duration(s.lc.DeliverTimeout)
 	if timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(req.Context(), timeout)
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 		req = req.WithContext(ctx)
 	}
@@ -52,10 +56,75 @@ func (s *session) dispatch(raw []byte) {
 	s.reply(code, msg)
 }
 
+// forwardedHeaders is the allowlist of message header names copied into the
+// synthesized request. Anything not listed here is dropped, so a remote sender
+// cannot smuggle HTTP-level headers (Authorization, Cookie, Content-Length,
+// X-Forwarded-For, ...) into a reverse_proxy route. Envelope metadata is set
+// separately and always overrides a message header of the same name.
+var forwardedHeaders = map[string]struct{}{
+	"auto-submitted":              {},
+	"cc":                          {},
+	"comments":                    {},
+	"content-description":         {},
+	"content-disposition":         {},
+	"content-id":                  {},
+	"content-language":            {},
+	"content-transfer-encoding":   {},
+	"content-type":                {},
+	"date":                        {},
+	"delivered-to":                {},
+	"disposition-notification-to": {},
+	"errors-to":                   {},
+	"from":                        {},
+	"importance":                  {},
+	"in-reply-to":                 {},
+	"keywords":                    {},
+	"mail-followup-to":            {},
+	"mail-reply-to":               {},
+	"message-id":                  {},
+	"mime-version":                {},
+	"organization":                {},
+	"precedence":                  {},
+	"priority":                    {},
+	"received":                    {},
+	"references":                  {},
+	"reply-to":                    {},
+	"resent-from":                 {},
+	"resent-to":                   {},
+	"return-path":                 {},
+	"sender":                      {},
+	"subject":                     {},
+	"thread-index":                {},
+	"thread-topic":                {},
+	"to":                          {},
+	"user-agent":                  {},
+	"x-mailer":                    {},
+}
+
+// forwardedHeaderPrefixes covers list-management and filtering headers that
+// are legitimately numerous: List-Id, List-Unsubscribe, X-Spam-Status, ARC-*.
+var forwardedHeaderPrefixes = []string{"list-", "x-spam-", "x-virus-", "arc-"}
+
+// forwardHeader reports whether a message header may be copied to the request.
+func forwardHeader(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if _, ok := forwardedHeaders[n]; ok {
+		return true
+	}
+	for _, p := range forwardedHeaderPrefixes {
+		if strings.HasPrefix(n, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *session) buildRequest(raw []byte) *http.Request {
 	hdr := http.Header{}
 	for _, h := range parseHeaderLines(raw) {
-		hdr.Add(h[0], h[1])
+		if forwardHeader(h[0]) {
+			hdr.Add(h[0], h[1])
+		}
 	}
 	hdr.Set("X-Envelope-From", s.from)
 	hdr.Set("X-Envelope-To", strings.Join(s.rcpts, ","))

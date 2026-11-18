@@ -3,14 +3,24 @@
 Imagine sending email was easy again. No wrangling 20 binaries just adding endpoints
 to an API. And sending was just as easy calling an API. That is the goal of `caddy-email`.
 
-1. **SMTP API** (`pkg/smtp/`) — accepts incoming mail on ports 25, 587, or whatever.
-   STARTTLS, SASL PLAIN, sender/recipient filtering, and routing to Caddy handlers.
-2. **Sendmail HTTP handler** (`pkg/sendmail/`) — POST email via API instead of
-   installing sendmail like it's 1999.
-3. **MTA Worker** (`pkg/mta/`) — outbound delivery queue with MX failover,
-   DKIM signing, optional require-TLS, exponential backoff + jitter, partial
-   delivery, RFC 3464 bounces delivered back to the sender, and the emotional
-   resilience to keep retrying after the 4th deferral.
+`caddy-email` is transactional mail in and out, not a full mail system. It does
+two things, and only two:
+
+1. **Inbound** (`pkg/smtp/`) — receives mail, full stop. It accepts a message on
+   ports 25, 587, or whatever, optionally upgrades with STARTTLS, and hands the
+   parsed message to a Caddy route. It is receive-only: it never stores mail,
+   never serves it back, and never forwards it onward.
+2. **Outbound** (`pkg/sendmail/` + `pkg/mta/`) — sends mail, full stop. The
+   `sendmail` HTTP handler spools a message via API instead of installing
+   sendmail like it's 1999; the `mta` worker delivers it directly via MX
+   failover, or relays it to a configured smarthost (`relay`), with DKIM
+   signing, optional require-TLS, exponential backoff + jitter, partial
+   delivery, and RFC 3464 bounces to the sender.
+
+There is no mailbox: no POP3, no IMAP, no message store, and no retrieval.
+Inbound mail is never forwarded onward; outbound mail is delivered directly or
+relayed to a smarthost. If you want a mail server users log into and read, this
+is not it.
 
 ---
 
@@ -87,13 +97,14 @@ curl -X POST https://mail.example.com/sendmail/ \
 ### Inbound email (webhook-style)
 
 Accept SMTP on port 25 and `route` it to your app. Headers carry envelope
-metadata, body is the message.
+metadata, body is the message. The listener only receives: it has no mailbox and
+no forwarding, so each message lives or dies by what your route does with it.
 
 ```caddyfile
 {
     smtp :25 {
         hostname mx.example.com
-        permit_mynetworks 10.0.0.0/8
+        max_connections 200
         route { reverse_proxy localhost:8080 }
     }
 }
@@ -111,26 +122,34 @@ That's the whole point.
 
 ### Port 25 SMTP relay for internal apps
 
-Legacy apps that speak SMTP but you don't want an open relay.
+Legacy apps that speak SMTP but you don't want an open relay. The listener has
+no relay policy of its own: it accepts, parses, and hands every message to the
+route, so decide there, by matching the client address:
 
 ```caddyfile
 {
     smtp :25 {
-        permit_mynetworks 10.0.0.0/8 172.16.0.0/12
+        route {
+            @internal remote_ip 10.0.0.0/8 172.16.0.0/12
+            reverse_proxy @internal localhost:8080
+            respond "Relay not permitted" 550
+        }
     }
     mta { spool_dir /var/lib/caddy/spool }
 }
 ```
 
-External clients are blocked. Test with swaks:
+External clients get `550` and never reach your app. Test with swaks:
 
 ```bash
 swaks --to user@gmail.com --from app@example.com --server 10.0.5.3 --body "hi"
 ```
 
-### Port 587 submission server
+### Port 587 with STARTTLS
 
-For MUAs (Thunderbird, Outlook, your phone). STARTTLS + auth required.
+Encrypt the session for clients that support it. There is no `AUTH`: the
+listener is receive-only and never advertises it, so a client is allowed by the
+route, not by credentials.
 
 ```caddyfile
 {
@@ -138,8 +157,6 @@ For MUAs (Thunderbird, Outlook, your phone). STARTTLS + auth required.
         tls starttls
         tls_cert_file /etc/letsencrypt/live/mail.example.com/fullchain.pem
         tls_key_file /etc/letsencrypt/live/mail.example.com/privkey.pem
-        auth required
-        auth_credentials alice s3cret bob hunter2
     }
     mta {
         spool_dir /var/lib/caddy/spool
@@ -152,21 +169,24 @@ For MUAs (Thunderbird, Outlook, your phone). STARTTLS + auth required.
 }
 ```
 
-Port 587 defaults: `tls starttls`, `auth required`. If you set `auth required`
-without `auth_credentials`, the module refuses to start. You have been warned.
+`tls` accepts only `starttls` or `off`, and `off` is the default on every port.
+With `starttls`, a certificate is required and the session upgrades in place
+when the client sends `STARTTLS`.
 
 ### Docker
 
 ```bash
 docker build -t caddy-email .
 docker run -d -p 80:80 -p 25:25 \
-  -v /path/to/Caddyfile:/etc/caddy/Caddyfile \
+  -v /path/to/Caddyfile:/srv/www/Caddyfile \
   -v caddy-data:/var/lib/caddy \
   caddy-email
 ```
 
 See the `Dockerfile` for the scratch image — ~5 MB binary, nothing but caddy,
-toybox, and a prayer.
+toybox, and a prayer. The image loads `/srv/www/Caddyfile`, which is the
+default config shipped in `www/`. To check a built image end to end, deliver a
+message into its SMTP route with `tests/e2e/container.sh <image>`.
 
 ---
 
@@ -230,10 +250,18 @@ sendmail {
 
 | Directive | Default | Description |
 |---|---|---|
-| `from` | — | Default `From` |
-| `default_subject` | — | Default `Subject` |
-| `max_body_size` | 30 MB | Max request body |
-| `allowed_from` | all | Restrict which senders are allowed (`@example.com`) |
+| `from` | none | Default `From` when the request omits one |
+| `default_subject` | none | Default `Subject` when the request omits one |
+| `max_body_size` | 30 MB | Max request body; anything larger gets `413` |
+| `allowed_from` | all allowed | Sender allowlist; a non-match gets `403` |
+
+`allowed_from` takes one or more patterns, matched against the envelope sender:
+
+| Pattern | Matches |
+|---|---|
+| `user@example.com` | That exact sender |
+| `example.com` or `@example.com` | Any sender in that domain |
+| `*example.com` | Any sender ending in `example.com`, with no domain-boundary check |
 
 ### Template function
 
@@ -259,14 +287,9 @@ sendmail {
         tls                 starttls
         tls_cert_file       /etc/certs/fullchain.pem
         tls_key_file        /etc/certs/privkey.pem
-        auth                required
-        auth_credentials    user1 pass1 user2 pass2
-        reject_from         *@spam.com
-        reject_rcpt         *@disposable.tld
         max_message_size    26214400
         max_recipients      50
         max_connections     200
-        permit_mynetworks   10.0.0.0/8
         deliver_timeout     30s
         route {
             reverse_proxy localhost:8080
@@ -275,18 +298,26 @@ sendmail {
 }
 ```
 
-Port defaults:
+| Option | Default | Description |
+|---|---|---|
+| `hostname` | system hostname | Name used in the greeting and the `EHLO` reply |
+| `tls` | `off` | `starttls` or `off`; anything else is rejected |
+| `tls_cert_file` | none | Certificate chain; required when `tls starttls` |
+| `tls_key_file` | none | Private key; required when `tls starttls` |
+| `max_message_size` | 25 MiB | A `DATA` body past this is rejected with `552` |
+| `max_recipients` | 50 | The 51st `RCPT TO` is rejected with `452` |
+| `max_connections` | 200 | Concurrent connections; further clients wait |
+| `deliver_timeout` | 30s | Read and write deadline, and the idle-session cap |
+| `route` | none | Caddy route the parsed message is handed to |
 
-| Port | TLS | Auth | `permit_mynetworks` |
-|---|---|---|---|
-| 25 | off | off | `127.0.0.0/8 ::1/128` (block relay) |
-| 587 | starttls | required | none |
-| other | off | off | none |
+The block is repeatable, so `smtp :25 { ... }` and `smtp :587 { ... }` declare
+two independent listeners.
 
-- `tls` only accepts `starttls` or `off`. Typos are rejected.
-- `auth required` without `auth_credentials` is a hard error.
-- Port 25 + `route` without `auth required` = open relay (the module warns).
-- Malformed CIDRs in `permit_mynetworks` are logged as warnings.
+There are no port-specific defaults. Every listener starts with `tls off`, no
+authentication, and no relay policy. `route` is optional, and a listener without
+one accepts every message with `250`. Relaying, sender filtering, and recipient
+filtering are all decisions for the route, which is what the port 25 relay
+example above does with a `remote_ip` matcher.
 
 ### What the route handler sees
 
@@ -298,11 +329,51 @@ Port defaults:
 | `Client-IP` | Remote address |
 | `Smtp-TLS` | `"true"` if STARTTLS |
 
+Message headers are also forwarded, but only from an allowlist: standard
+envelope and content headers plus `List-*`, `ARC-*`, `X-Spam-*`, and
+`X-Virus-*`. Anything else, including `Authorization`, `Cookie`,
+`Content-Length`, and `X-Forwarded-For`, is dropped so a sender cannot inject
+HTTP-level headers into a `reverse_proxy` route.
+
 Advertised extensions: `SIZE`, `PIPELINING`, `ENHANCEDSTATUSCODES`,
 `8BITMIME`, and `STARTTLS` when configured. No `AUTH`: this is a receive-only
 listener and all policy belongs to the route. A `552` oversized message is
 answered only after the rest of `DATA` is drained, so the remainder of the
 body is never parsed as commands.
+
+### Placeholders
+
+The synthesized request carries a Caddy replacer, so the route can read session
+state with `{smtp.*}`:
+
+| Placeholder | Value |
+|---|---|
+| `{smtp.remote_ip}` | Client address |
+| `{smtp.local_ip}` | Local address |
+| `{smtp.hostname}` | Configured `hostname` |
+| `{smtp.helo}` | `EHLO`/`HELO` argument |
+| `{smtp.from}` | `MAIL FROM` address |
+| `{smtp.rcpt}` | Most recent `RCPT TO` address |
+| `{smtp.rcpts}` | Every `RCPT TO` collected so far |
+| `{smtp.tls}` | `true` once `STARTTLS` has completed |
+
+### Session flow
+
+A normal SMTP dialogue. `EHLO`/`HELO` records the client name (visible as
+`{smtp.helo}`), `MAIL FROM:<addr>` sets the sender (`MAIL FROM:<>`, the null
+sender, is accepted), one or more `RCPT TO:<addr>` set the recipients, and
+`DATA` collects the body until a lone `.` line, with leading dots unescaped
+(`..` becomes `.`). `RSET` clears the current transaction, `NOOP` does nothing,
+`QUIT` ends the session, and an unrecognized command gets `500`. `DATA` before
+`MAIL` or `RCPT` gets `503`.
+
+Reads are bounded by `deliver_timeout`, rearmed before every read, so an idle
+client is dropped but a slow-but-active transfer is not, and a single line is
+capped so an unterminated line cannot exhaust memory. Past `max_message_size` the
+listener answers `552` and then drains the rest of `DATA`, so trailing body lines
+are never misparsed as commands; a client that keeps streaming is disconnected.
+`STARTTLS` is refused once a transaction is open or TLS is already active, and
+the handshake discards the pre-TLS session state.
 
 ---
 
@@ -453,10 +524,14 @@ Fire-and-forget. If your webhook is down, that's your problem now.
 
 ### Crash recovery
 
-On startup, stale `active/` files (older than `2 × connect_timeout`) are
-moved back to `incoming/` for reprocessing. Because yes, things crash.
-Deferred jobs whose `next_at` has passed are swept back into `incoming/` on
-every tick, so `deferred/` is a waiting room and not a graveyard.
+Stale `active/` entries (older than `2 × connect_timeout`) are moved back to
+`incoming/` for reprocessing, both at startup and on every janitor pass, so a
+job claimed moments before a crash is not stranded. A pair split by a crash
+between its two file moves is reunited (the body `df` is the leader and `qf` is
+moved to join it), an orphan body from an interrupted enqueue is removed, and a
+`qf` with no body is quarantined. Deferred jobs whose `next_at` has passed are
+swept back into `incoming/` on every tick, so `deferred/` is a waiting room and
+not a graveyard. Because yes, things crash.
 
 ---
 
@@ -561,15 +636,17 @@ spool costs one directory walk. The counters are exact.
 
 | Error | Fix |
 |---|---|
-| `port 25 requires explicit permit_mynetworks` | Add `permit_mynetworks` or switch to port 587 |
-| `auth=required but no auth_credentials` | Add `auth_credentials user pass` pairs |
-| `sendmail requires the mta app` | Add `mta { spool_dir ... }` global block |
+| `unknown smtp option: auth` | The listener has no AUTH; filter in the route instead |
+| `unknown sendmail option: ...` | Only `from`, `default_subject`, `max_body_size`, `allowed_from` exist |
+| `sendmail requires the mta app` | Add an `mta { spool_dir ... }` global block |
+| `sendmail template functions require the mta app` | Same: the template function needs the `mta` app |
 | `spool ... is locked by another instance` | Two Caddies share `spool_dir`; give each its own |
 | `spool quota exceeded` (503) | Spool is over `max_spool_bytes`; raise it or drain the queue |
-| `550 Relay not permitted` | Client IP not in `permit_mynetworks`; use port 587 with auth |
 | `invalid tls value` | Only `starttls` and `off` are accepted |
-| Messages stuck in `incoming/` | Check MTA logs, DNS resolution, that `mta` block exists |
-| DKIM fails verification | Domain mismatch? DNS record wrong? `simple/simple` vs `relaxed/relaxed`? |
+| `tls=starttls requires tls_cert_file and tls_key_file` | Set both, or use `tls off` |
+| `invalid relay` | `relay` needs a host: `host:port` or `host` |
+| Messages stuck in `incoming/` | Check MTA logs, DNS resolution, and that the `mta` block exists |
+| Mail accepted but never delivered | Check `relay`/DNS reachability and the per-MX semaphore (`per_mx_concurrency`) |
 
 ---
 
@@ -577,7 +654,10 @@ spool costs one directory walk. The counters are exact.
 
 | What | Status | Deal with it |
 |---|---|---|
-| Only PLAIN auth | ⏳ | Use STARTTLS |
+| Not a full mail system | ❌ | No mailbox: inbound goes to a route, outbound goes to the wire |
+| Mail forwarding | ❌ | Inbound mail is handed to your route; nothing relays it onward |
+| No SMTP `AUTH` | ⏳ | The listener is receive-only; gate in the route |
+| No relay policy on the listener | ⏳ | Match `remote_ip` in the route |
 | Only simple/simple DKIM | ⏳ | May fail with some receivers |
 | One DSN per failed job | ⏳ | Lists every failed recipient in one report |
 | No MTA-STS / DANE | ⏳ | `require_tls` only enforces opportunistic STARTTLS |
@@ -585,4 +665,5 @@ spool costs one directory walk. The counters are exact.
 | Metrics endpoint | ✅ | Exposed on Caddy's `/metrics`; see Metrics |
 | File attachments in sendmail | ⏳ | Pre-build MIME, POST as `message/rfc822` |
 | Queue inspection API | ⏳ | Read files in `spool_dir` |
+| No received-header tracing | ⏳ | The MTA does not prepend `Received:` |
 | IMAP/POP3 | ❌ | This is an MTA, not a boyfriend |

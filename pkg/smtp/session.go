@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -19,10 +20,11 @@ type session struct {
 	writer *bufio.Writer
 	repl   *caddy.Replacer
 
-	helo  string
-	from  string
-	rcpts []string
-	tlsOn bool
+	helo     string
+	from     string
+	rcpts    []string
+	mailSeen bool
+	tlsOn    bool
 
 	// closing is set when the peer must be disconnected after the current
 	// command (for example after it keeps streaming an oversized body).
@@ -64,13 +66,55 @@ func (s *session) refreshDeadline() {
 	}
 }
 
+// Line length caps. No real client sends a command anywhere near
+// maxCommandLine, and capping the body line bounds the memory a single
+// unterminated line can consume before max_message_size is enforced.
+const (
+	maxCommandLine = 8 << 10
+	maxDataLine    = 1 << 20
+)
+
+var errLineTooLong = errors.New("smtp: line too long")
+
+// readLine reads one '\n'-terminated line, bounded by limit bytes. When the
+// line exceeds the limit it consumes and discards the remainder of that line
+// and returns errLineTooLong, letting the caller reply and resynchronize
+// instead of buffering an unbounded line.
+func (s *session) readLine(limit int) (string, error) {
+	var buf []byte
+	for {
+		chunk, err := s.reader.ReadSlice('\n')
+		buf = append(buf, chunk...)
+		if len(buf) > limit {
+			for err == bufio.ErrBufferFull {
+				_, err = s.reader.ReadSlice('\n')
+			}
+			if err != nil {
+				return "", err
+			}
+			return "", errLineTooLong
+		}
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		return string(buf), nil
+	}
+}
+
 func (s *session) run() {
 	s.refreshDeadline()
 	s.replyf("220 %s ESMTP ready", s.lc.Hostname)
 	for {
 		s.refreshDeadline()
-		line, err := s.reader.ReadString('\n')
+		line, err := s.readLine(maxCommandLine)
 		if err != nil {
+			if errors.Is(err, errLineTooLong) {
+				s.reply(500, "5.5.2 Line too long")
+				continue
+			}
 			return
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -90,8 +134,7 @@ func (s *session) run() {
 		case "DATA":
 			s.handleData()
 		case "RSET":
-			s.from = ""
-			s.rcpts = nil
+			s.resetTransaction()
 			s.reply(250, "OK")
 		case "NOOP":
 			s.reply(250, "OK")
@@ -146,9 +189,23 @@ func (s *session) handleMail(args string) {
 		s.reply(501, "Syntax: MAIL FROM:<addr>")
 		return
 	}
+	s.mailSeen = true
 	s.from = from
 	s.repl.Set("smtp.from", from)
 	s.reply(250, "OK")
+}
+
+// resetTransaction clears the envelope and the placeholders that expose it, so
+// a later transaction (or a post-STARTTLS route) cannot observe a stale
+// MAIL/RCPT from an earlier one. A null sender stays distinguishable from "no
+// MAIL yet" because mailSeen is tracked separately from the sender value.
+func (s *session) resetTransaction() {
+	s.mailSeen = false
+	s.from = ""
+	s.rcpts = nil
+	s.repl.Set("smtp.from", "")
+	s.repl.Set("smtp.rcpt", "")
+	s.repl.Set("smtp.rcpts", "")
 }
 
 func (s *session) handleRcpt(args string) {
@@ -168,7 +225,7 @@ func (s *session) handleRcpt(args string) {
 }
 
 func (s *session) handleData() {
-	if s.from == "" {
+	if !s.mailSeen {
 		s.reply(503, "MAIL FROM first")
 		return
 	}
@@ -180,8 +237,13 @@ func (s *session) handleData() {
 	var body bytes.Buffer
 	for {
 		s.refreshDeadline()
-		line, err := s.reader.ReadString('\n')
+		line, err := s.readLine(maxDataLine)
 		if err != nil {
+			if errors.Is(err, errLineTooLong) {
+				s.reply(552, "5.3.4 Line too long")
+				s.drainData()
+				s.resetTransaction()
+			}
 			return
 		}
 		if line == ".\r\n" || line == ".\n" {
@@ -195,15 +257,13 @@ func (s *session) handleData() {
 			// Drain the rest of DATA so the remaining body lines are not
 			// parsed as SMTP commands, then abort the transaction.
 			s.drainData()
-			s.from = ""
-			s.rcpts = nil
+			s.resetTransaction()
 			return
 		}
 		body.WriteString(line)
 	}
 	s.dispatch(body.Bytes())
-	s.from = ""
-	s.rcpts = nil
+	s.resetTransaction()
 }
 
 // drainData consumes lines until the end-of-data terminator, so that after an
@@ -215,8 +275,11 @@ func (s *session) drainData() {
 	limit := s.lc.MaxMessageSize
 	for {
 		s.refreshDeadline()
-		line, err := s.reader.ReadString('\n')
+		line, err := s.readLine(maxDataLine)
 		if err != nil {
+			if errors.Is(err, errLineTooLong) {
+				continue
+			}
 			return
 		}
 		if line == ".\r\n" || line == ".\n" {
@@ -241,6 +304,14 @@ func (s *session) handleSTARTTLS() {
 		s.reply(502, "STARTTLS not configured")
 		return
 	}
+	if s.tlsOn {
+		s.reply(503, "TLS already active")
+		return
+	}
+	if s.mailSeen || len(s.rcpts) > 0 {
+		s.reply(503, "STARTTLS not allowed during a transaction")
+		return
+	}
 	s.reply(220, "Ready to start TLS")
 	tlsConn := tls.Server(s.conn, &tls.Config{
 		Certificates: []tls.Certificate{*s.lc.tlsCert},
@@ -254,6 +325,11 @@ func (s *session) handleSTARTTLS() {
 	s.writer = bufio.NewWriter(tlsConn)
 	s.tlsOn = true
 	s.repl.Set("smtp.tls", "true")
+	// RFC 3207 section 4.2: discard any state obtained before the handshake
+	// that was not itself obtained over TLS.
+	s.resetTransaction()
+	s.helo = ""
+	s.repl.Set("smtp.helo", "")
 }
 
 func splitCmd(line string) (string, string) {

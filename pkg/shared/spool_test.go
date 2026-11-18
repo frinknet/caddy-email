@@ -226,8 +226,123 @@ func TestRecoverActive(t *testing.T) {
 	if err := Claim(dir, id); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if n := RecoverActive(dir, 0); n != 1 {
+	if n := RecoverActive(dir, 0, nil); n != 1 {
 		t.Fatalf("expected 1 recovered, got %d", n)
+	}
+}
+
+// TestRecoverActiveTooRecent checks that a job claimed within the cutoff is not
+// yanked from under a live delivery, and that it is recovered once it ages out.
+func TestRecoverActiveTooRecent(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	id, err := Enqueue(dir, &Envelope{From: "a@b", To: []string{"c@d"}}, []byte("test"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := Claim(dir, id); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	// Its qf was just written, so a one-hour cutoff excludes it.
+	if n := RecoverActive(dir, time.Hour, nil); n != 0 {
+		t.Fatalf("recent job should not be recovered, got %d", n)
+	}
+	if _, err := os.Stat(filepath.Join(dir, StateActive, "qf"+id)); err != nil {
+		t.Fatalf("recent job should stay active: %v", err)
+	}
+	// A nil cutoff recovers it.
+	if n := RecoverActive(dir, 0, nil); n != 1 {
+		t.Fatalf("expected 1 recovered with no cutoff, got %d", n)
+	}
+}
+
+// TestRecoverActiveSkipsInFlight checks that the skip predicate protects a job
+// the process is currently delivering.
+func TestRecoverActiveSkipsInFlight(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	id, err := Enqueue(dir, &Envelope{From: "a@b", To: []string{"c@d"}}, []byte("test"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := Claim(dir, id); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if n := RecoverActive(dir, 0, func(got string) bool { return got == id }); n != 0 {
+		t.Fatalf("in-flight job should be skipped, got %d", n)
+	}
+}
+
+// TestReconcileSpoolHealsSplitPair checks that a qf and df split across state
+// directories are reunited according to where the df landed.
+func TestReconcileSpoolHealsSplitPair(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	id, err := Enqueue(dir, &Envelope{From: "a@b", To: []string{"c@d"}}, []byte("body"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := Claim(dir, id); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	// Simulate a crash mid-Defer: df reached deferred/, qf stayed in active/.
+	def := filepath.Join(dir, StateDeferred)
+	if err := os.MkdirAll(def, 0700); err != nil {
+		t.Fatalf("mkdir deferred: %v", err)
+	}
+	if err := os.Rename(filepath.Join(dir, StateActive, "df"+id), filepath.Join(def, "df"+id)); err != nil {
+		t.Fatalf("split df: %v", err)
+	}
+
+	if n := ReconcileSpool(dir); n != 1 {
+		t.Fatalf("expected 1 repair, got %d", n)
+	}
+	if _, err := os.Stat(filepath.Join(def, "qf"+id)); err != nil {
+		t.Errorf("qf was not reunited with df in deferred/: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, StateActive, "qf"+id)); !os.IsNotExist(err) {
+		t.Errorf("qf still in active/: %v", err)
+	}
+}
+
+// TestReconcileSpoolRemovesOrphanBody checks that a df with no qf (an
+// interrupted Enqueue) is removed rather than growing the spool forever.
+func TestReconcileSpoolRemovesOrphanBody(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	inc := filepath.Join(dir, StateIncoming)
+	if err := os.MkdirAll(inc, 0700); err != nil {
+		t.Fatalf("mkdir incoming: %v", err)
+	}
+	orphan := filepath.Join(inc, "dforphan")
+	if err := os.WriteFile(orphan, []byte("body"), 0600); err != nil {
+		t.Fatalf("write orphan: %v", err)
+	}
+	if n := ReconcileSpool(dir); n != 1 {
+		t.Fatalf("expected 1 repair, got %d", n)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Errorf("orphan df was not removed: %v", err)
+	}
+}
+
+// TestReconcileSpoolQuarantinesBodylessQF checks that a committed qf with no df
+// is moved to corrupt/ instead of sitting in the queue undeliverable.
+func TestReconcileSpoolQuarantinesBodylessQF(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	id, err := Enqueue(dir, &Envelope{From: "a@b", To: []string{"c@d"}}, []byte("body"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := os.Remove(filepath.Join(dir, StateIncoming, "df"+id)); err != nil {
+		t.Fatalf("remove df: %v", err)
+	}
+	if n := ReconcileSpool(dir); n != 1 {
+		t.Fatalf("expected 1 repair, got %d", n)
+	}
+	if _, err := os.Stat(filepath.Join(dir, StateCorrupt, "qf"+id)); err != nil {
+		t.Errorf("bodyless qf was not quarantined: %v", err)
 	}
 }
 

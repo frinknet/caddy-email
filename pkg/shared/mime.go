@@ -27,14 +27,22 @@ func SanitizeHeaderValue(v string) string {
 // is safe to place in a message header or an SMTP command. Empty strings, CR/LF
 // injection attempts, and anything net/mail cannot parse are rejected.
 func ValidAddress(s string) bool {
+	_, ok := NormalizeAddress(s)
+	return ok
+}
+
+// NormalizeAddress parses s and returns its bare addr-spec, so a display name
+// ("Name <a@b>") cannot reach the SMTP envelope or a DKIM d= tag. The second
+// result is false when s is not a valid address.
+func NormalizeAddress(s string) (string, bool) {
 	if s == "" || strings.ContainsAny(s, "\r\n\x00") {
-		return false
+		return "", false
 	}
 	a, err := mail.ParseAddress(s)
-	if err != nil {
-		return false
+	if err != nil || a.Address == "" || !strings.Contains(a.Address, "@") {
+		return "", false
 	}
-	return a.Address != "" && strings.Contains(a.Address, "@")
+	return a.Address, true
 }
 
 // ValidHeaderValue reports whether v is free of CR/LF and can be written into a

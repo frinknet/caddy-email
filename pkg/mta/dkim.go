@@ -1,6 +1,7 @@
 package mta
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -21,11 +22,20 @@ type DKIMConfig struct {
 	parsedKey *rsa.PrivateKey
 }
 
-// dkimSign adds a DKIM-Signature header to the message body.
-// It uses "simple/simple" canonicalization and sha256.
-func dkimSign(body []byte, cfg *DKIMConfig, fromDomain string) ([]byte, error) {
+// dkimSignedHeaders is the h= tag: the header fields covered by the signature,
+// in the order they are presented to the signing algorithm.
+const dkimSignedHeaders = "From:To:Subject:Date:MIME-Version:Content-Type"
+
+// dkimSign prepends a DKIM-Signature header to the message.
+// It uses "simple/simple" canonicalization and rsa-sha256.
+//
+// Per RFC 6376 section 3.7 the signature covers the signed headers (in the
+// order given by h=, each terminated with CRLF), followed by the DKIM-Signature
+// header itself with an empty b= value and no trailing CRLF. The emitted header
+// then carries the base64 signature after "b=".
+func dkimSign(raw []byte, cfg *DKIMConfig, fromDomain string) ([]byte, error) {
 	if cfg == nil || cfg.parsedKey == nil {
-		return body, nil
+		return raw, nil
 	}
 
 	domain := cfg.Domain
@@ -33,76 +43,91 @@ func dkimSign(body []byte, cfg *DKIMConfig, fromDomain string) ([]byte, error) {
 		domain = fromDomain
 	}
 	if domain == "" {
-		return body, nil
+		return raw, nil
 	}
 
-	// Compute body hash (simple canonicalization — no transformation)
-	hasher := sha256.New()
-	hasher.Write(body)
-	bh := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
+	header, body := splitMessage(raw)
 
-	// Build the unsigned DKIM-Signature header
-	sigHeaders := []string{
+	// Body hash: simple canonicalization over the body only.
+	sum := sha256.Sum256(canonicalizeSimpleBody(body))
+	bh := base64.StdEncoding.EncodeToString(sum[:])
+
+	// The DKIM-Signature header with an empty b= value. This exact byte string
+	// is what a verifier reconstructs and hashes.
+	unsigned := "DKIM-Signature: " + strings.Join([]string{
 		"v=1",
 		"a=rsa-sha256",
 		"c=simple/simple",
-		fmt.Sprintf("d=%s", domain),
-		fmt.Sprintf("s=%s", cfg.Selector),
+		"d=" + domain,
+		"s=" + cfg.Selector,
 		"bh=" + bh,
-		"h=From:To:Subject:Date:MIME-Version:Content-Type",
+		"h=" + dkimSignedHeaders,
+	}, "; ") + "; b="
+
+	// Hash step 2: the signed headers first, in h= order, then the empty-b=
+	// DKIM-Signature header, with no trailing CRLF.
+	var sigInput []byte
+	for _, name := range strings.Split(dkimSignedHeaders, ":") {
+		if line, ok := lastHeader(header, name); ok {
+			sigInput = append(sigInput, line...)
+			sigInput = append(sigInput, '\r', '\n')
+		}
 	}
-	sigHeader := "DKIM-Signature: " + strings.Join(sigHeaders, "; ") + ";"
+	sigInput = append(sigInput, unsigned...)
 
-	// Compute the signature over the header (simple canonicalization)
-	sigInput := sigHeader + "\r\n"
-	// Add the listed headers from the body (simple: header line + CRLF)
-	headers := extractDKIMHeaders(body, strings.Split("From:To:Subject:Date:MIME-Version:Content-Type", ":"))
-	for _, h := range headers {
-		sigInput += h + "\r\n"
-	}
-
-	hasher = sha256.New()
-	hasher.Write([]byte(sigInput))
-	digest := hasher.Sum(nil)
-
-	sig, err := rsa.SignPKCS1v15(rand.Reader, cfg.parsedKey, crypto.SHA256, digest)
+	digest := sha256.Sum256(sigInput)
+	sig, err := rsa.SignPKCS1v15(rand.Reader, cfg.parsedKey, crypto.SHA256, digest[:])
 	if err != nil {
 		return nil, fmt.Errorf("dkim sign: %w", err)
 	}
 
-	// Append the signature value
-	sigHeader += " b=" + base64.StdEncoding.EncodeToString(sig)
+	sigHeader := unsigned + base64.StdEncoding.EncodeToString(sig)
 
-	// Prepend the DKIM-Signature header to the body
-	result := make([]byte, 0, len(sigHeader)+2+len(body))
-	result = append(result, []byte(sigHeader+"\r\n")...)
-	result = append(result, body...)
+	result := make([]byte, 0, len(sigHeader)+2+len(raw))
+	result = append(result, sigHeader...)
+	result = append(result, '\r', '\n')
+	result = append(result, raw...)
 	return result, nil
 }
 
-// extractDKIMHeaders extracts header lines matching the given names from the raw message.
-// Simple canonicalization: return header name + ":" + value (unfolded, no whitespace changes).
-func extractDKIMHeaders(raw []byte, names []string) []string {
-	want := make(map[string]bool, len(names))
-	for _, n := range names {
-		want[strings.ToLower(n)] = true
+// splitMessage splits a raw message into its header block and body at the first
+// empty line. When there is no separator the whole input is treated as headers.
+func splitMessage(raw []byte) (header, body []byte) {
+	if i := bytes.Index(raw, []byte("\r\n\r\n")); i >= 0 {
+		return raw[:i], raw[i+4:]
 	}
-	var result []string
-	for _, line := range strings.Split(string(raw), "\r\n") {
-		if line == "" {
-			break
-		}
-		colon := strings.Index(line, ":")
+	if i := bytes.Index(raw, []byte("\n\n")); i >= 0 {
+		return raw[:i], raw[i+2:]
+	}
+	return raw, nil
+}
+
+// canonicalizeSimpleBody applies RFC 6376 section 3.4.3: trailing empty lines
+// collapse to a single CRLF, and a missing or empty body canonicalizes to a
+// single CRLF.
+func canonicalizeSimpleBody(body []byte) []byte {
+	core := bytes.TrimRight(body, "\r\n")
+	out := make([]byte, 0, len(core)+2)
+	out = append(out, core...)
+	out = append(out, '\r', '\n')
+	return out
+}
+
+// lastHeader returns the last line of the header block whose field name matches
+// name (case-insensitively), as it appears in the message, without its CRLF.
+// RFC 6376 section 5.4.2 requires the physically last instance.
+func lastHeader(header []byte, name string) ([]byte, bool) {
+	var found []byte
+	for _, line := range bytes.Split(header, []byte("\r\n")) {
+		colon := bytes.IndexByte(line, ':')
 		if colon < 0 {
 			continue
 		}
-		name := strings.ToLower(strings.TrimSpace(line[:colon]))
-		if want[name] {
-			result = append(result, line)
-			delete(want, name) // first occurrence only
+		if strings.EqualFold(string(line[:colon]), name) {
+			found = line
 		}
 	}
-	return result
+	return found, found != nil
 }
 
 // parseDKIMKey decodes a PEM-encoded RSA private key.
