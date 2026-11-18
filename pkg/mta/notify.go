@@ -21,7 +21,7 @@ import (
 // fires for every event (delivered, deferred, bounced).
 func (m *MTA) notify(ev shared.DeliveryEvent) {
 	if m.NotifyURL == "" {
-		m.log.Info("mta: event",
+		m.logger().Info("mta: event",
 			zap.String("queue_id", ev.QueueID),
 			zap.String("event", ev.Event),
 		)
@@ -30,7 +30,7 @@ func (m *MTA) notify(ev shared.DeliveryEvent) {
 	select {
 	case m.notifyCh <- ev:
 	default:
-		m.log.Warn("mta: notify buffer full, dropping event",
+		m.logger().Warn("mta: notify buffer full, dropping event",
 			zap.String("id", ev.QueueID),
 			zap.String("event", ev.Event),
 		)
@@ -57,12 +57,12 @@ func (m *MTA) notifyWorker() {
 func (m *MTA) sendNotify(ev shared.DeliveryEvent) {
 	body, err := json.Marshal(ev)
 	if err != nil {
-		m.log.Warn("mta: notify marshal", zap.String("id", ev.QueueID), zap.Error(err))
+		m.logger().Warn("mta: notify marshal", zap.String("id", ev.QueueID), zap.Error(err))
 		return
 	}
 	req, err := http.NewRequest(http.MethodPost, m.NotifyURL, bytes.NewReader(body))
 	if err != nil {
-		m.log.Warn("mta: notify request", zap.String("id", ev.QueueID), zap.Error(err))
+		m.logger().Warn("mta: notify request", zap.String("id", ev.QueueID), zap.Error(err))
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -71,7 +71,7 @@ func (m *MTA) sendNotify(ev shared.DeliveryEvent) {
 	}
 	resp, err := m.notifyClient.Do(req)
 	if err != nil {
-		m.log.Warn("mta: notify", zap.String("id", ev.QueueID), zap.Error(err))
+		m.logger().Warn("mta: notify", zap.String("id", ev.QueueID), zap.Error(err))
 		return
 	}
 	// Cap the drain so a misbehaving endpoint can't force us to read
@@ -79,7 +79,7 @@ func (m *MTA) sendNotify(ev shared.DeliveryEvent) {
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		m.log.Warn("mta: notify non-2xx",
+		m.logger().Warn("mta: notify non-2xx",
 			zap.Int("status", resp.StatusCode),
 			zap.String("id", ev.QueueID),
 		)

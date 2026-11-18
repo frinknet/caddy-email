@@ -75,23 +75,44 @@ func parseTemplateArgs(args []any, defaultFrom string) (*shared.Envelope, []byte
 		if env.From == "" {
 			return nil, nil, fmt.Errorf("sendmail: from required")
 		}
-		appendStr := func(v any) {
-			if s, ok := v.(string); ok && s != "" {
-				env.To = append(env.To, s)
+		collect := func(key string) []string {
+			var out []string
+			switch v := m[key].(type) {
+			case string:
+				if v != "" {
+					out = append(out, v)
+				}
+			case []string:
+				out = append(out, v...)
 			}
-			if sl, ok := v.([]string); ok {
-				env.To = append(env.To, sl...)
-			}
+			return out
 		}
-		appendStr(m["to"])
-		appendStr(m["cc"])
-		appendStr(m["bcc"])
+		to := collect("to")
+		cc := collect("cc")
+		bcc := collect("bcc")
+		env.To = append(env.To, to...)
+		env.To = append(env.To, cc...)
+		env.To = append(env.To, bcc...)
 		if len(env.To) == 0 {
 			return nil, nil, fmt.Errorf("sendmail: recipients required")
 		}
 		subject, _ := m["subject"].(string)
 		body, _ := m["body"].(string)
-		return env, shared.BuildSimple(env.From, env.To, subject, body), nil
+		replyTo, _ := m["reply_to"].(string)
+		if replyTo == "" {
+			replyTo, _ = m["reply-to"].(string)
+		}
+		if err := validateEnvelope(env); err != nil {
+			return nil, nil, err
+		}
+		if replyTo != "" && !shared.ValidAddress(replyTo) {
+			return nil, nil, fmt.Errorf("sendmail: invalid reply-to address %q", replyTo)
+		}
+		if !shared.ValidHeaderValue(subject) {
+			return nil, nil, fmt.Errorf("sendmail: subject contains CR or LF")
+		}
+		// Bcc is kept in the envelope but must not appear in the headers.
+		return env, shared.BuildMessage(env.From, to, cc, replyTo, subject, body), nil
 	}
 
 	str := func(i int) string {
@@ -107,9 +128,15 @@ func parseTemplateArgs(args []any, defaultFrom string) (*shared.Envelope, []byte
 		if env.From == "" {
 			return nil, nil, fmt.Errorf("sendmail: from required (no default)")
 		}
+		if err := validateEnvelope(env); err != nil {
+			return nil, nil, err
+		}
 		return env, shared.BuildSimple(env.From, env.To, str(1), str(2)), nil
 	case 4: // from, to, subject, body
 		env := &shared.Envelope{From: str(0), To: []string{str(1)}}
+		if err := validateEnvelope(env); err != nil {
+			return nil, nil, err
+		}
 		return env, shared.BuildSimple(env.From, env.To, str(2), str(3)), nil
 	}
 	return nil, nil, fmt.Errorf("sendmail: expected 1 (dict), 3, or 4 arguments; got %d", len(args))

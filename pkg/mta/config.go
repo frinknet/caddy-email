@@ -142,6 +142,42 @@ func parseMTAOption(d *caddyfile.Dispenser, _ any) (any, error) {
 					return nil, err
 				}
 				m.MxCacheTTL = caddy.Duration(dur)
+			case "require_tls":
+				if !d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				v, err := strconv.ParseBool(d.Val())
+				if err != nil {
+					return nil, d.Errf("require_tls: %v", err)
+				}
+				m.RequireTLS = v
+			case "max_spool_bytes":
+				if !d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				n, err := strconv.ParseInt(d.Val(), 10, 64)
+				if err != nil {
+					return nil, err
+				}
+				m.MaxSpoolBytes = n
+			case "bounce_retention":
+				if !d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return nil, err
+				}
+				m.BounceRetention = caddy.Duration(dur)
+			case "shutdown_timeout":
+				if !d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				dur, err := caddy.ParseDuration(d.Val())
+				if err != nil {
+					return nil, err
+				}
+				m.ShutdownTimeout = caddy.Duration(dur)
 			case "dkim":
 				cfg := &DKIMConfig{}
 				for nesting := d.Nesting(); d.NextBlock(nesting); {

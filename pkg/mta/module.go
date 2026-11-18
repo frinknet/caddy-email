@@ -3,11 +3,13 @@ package mta
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
@@ -25,6 +27,10 @@ const notifyWorkers = 4
 // delivery before new events are dropped. Sized to absorb a burst from
 // a full concurrency batch.
 const notifyBuffer = 1024
+
+// spoolJanitorInterval is how often the janitor recomputes the spool size for
+// quota accounting and prunes expired bounce archives.
+const spoolJanitorInterval = 30 * time.Second
 
 func init() {
 	caddy.RegisterModule(new(MTA))
@@ -49,10 +55,15 @@ type MTA struct {
 	NotifyURL        string         `json:"notify_url,omitempty"`
 	NotifySecret     string         `json:"notify_secret,omitempty"`
 	MxCacheTTL       caddy.Duration `json:"mx_cache_ttl,omitempty"`
+	RequireTLS       bool           `json:"require_tls,omitempty"`
+	MaxSpoolBytes    int64          `json:"max_spool_bytes,omitempty"`
+	BounceRetention  caddy.Duration `json:"bounce_retention,omitempty"`
+	ShutdownTimeout  caddy.Duration `json:"shutdown_timeout,omitempty"`
 	DKIM             *DKIMConfig    `json:"dkim,omitempty"`
 
 	log          *zap.Logger
 	stopCh       chan struct{}
+	stopOnce     sync.Once
 	wg           sync.WaitGroup
 	notifyClient *http.Client
 	notifyCh     chan shared.DeliveryEvent
@@ -61,6 +72,12 @@ type MTA struct {
 	globalSem    chan struct{}
 	mxCache      map[string]mxCacheEntry
 	mxCacheMu    sync.RWMutex
+
+	// smtpPort is the port dialed on MX hosts. It is 25 in production and
+	// overridable only from tests.
+	smtpPort   string
+	spoolLock  io.Closer
+	spoolBytes atomic.Int64
 }
 
 func (*MTA) CaddyModule() caddy.ModuleInfo {
@@ -87,7 +104,6 @@ func (m *MTA) Provision(ctx caddy.Context) error {
 		m.notifyClient = &http.Client{Timeout: 10 * time.Second}
 	}
 	m.mxSem = make(map[string]chan struct{})
-	m.globalSem = make(chan struct{}, m.Concurrency)
 	m.mxCache = make(map[string]mxCacheEntry)
 
 	if m.DKIM != nil && m.DKIM.PrivateKey != "" {
@@ -98,6 +114,15 @@ func (m *MTA) Provision(ctx caddy.Context) error {
 		m.DKIM.parsedKey = key
 	}
 	return nil
+}
+
+// logger returns the configured logger, falling back to a no-op logger so the
+// module stays usable when it was not Provisioned (as in tests).
+func (m *MTA) logger() *zap.Logger {
+	if m.log == nil {
+		return zap.NewNop()
+	}
+	return m.log
 }
 
 func (m *MTA) applyDefaults() {
@@ -154,11 +179,35 @@ func (m *MTA) applyDefaults() {
 	if m.MxCacheTTL == 0 {
 		m.MxCacheTTL = caddy.Duration(5 * time.Minute)
 	}
+	if m.smtpPort == "" {
+		m.smtpPort = "25"
+	}
+	if m.BounceRetention == 0 {
+		m.BounceRetention = caddy.Duration(7 * 24 * time.Hour)
+	}
+	if m.ShutdownTimeout == 0 {
+		m.ShutdownTimeout = caddy.Duration(30 * time.Second)
+	}
 }
 
 func (m *MTA) Validate() error {
 	if m.SettleDelay < 0 {
 		return fmt.Errorf("mta: settle_delay must be >= 0")
+	}
+	if m.Concurrency < 1 {
+		return fmt.Errorf("mta: concurrency must be > 0")
+	}
+	if m.PerMXConcurrency < 1 {
+		return fmt.Errorf("mta: per_mx_concurrency must be > 0")
+	}
+	if m.MaxBatch < 1 {
+		return fmt.Errorf("mta: max_batch must be > 0")
+	}
+	if m.MaxRetries < 0 {
+		return fmt.Errorf("mta: max_retries must be >= 0")
+	}
+	if m.MaxSpoolBytes < 0 {
+		return fmt.Errorf("mta: max_spool_bytes must be >= 0")
 	}
 	if m.NotifyURL != "" {
 		u, err := url.Parse(m.NotifyURL)
@@ -166,21 +215,45 @@ func (m *MTA) Validate() error {
 			return fmt.Errorf("mta: invalid notify_url %q", m.NotifyURL)
 		}
 		if m.NotifySecret == "" {
-			m.log.Warn("mta: notify_url set without notify_secret; events will be unsigned")
+			m.logger().Warn("mta: notify_url set without notify_secret; events will be unsigned")
 		}
 	}
 	if m.NotifyURL == "" && m.NotifySecret != "" {
-		m.log.Warn("mta: notify_secret set without notify_url; no events will be sent")
+		m.logger().Warn("mta: notify_secret set without notify_url; no events will be sent")
 	}
 	return nil
 }
 
 func (m *MTA) Start() error {
+	// The spool is single-writer: two Caddy instances sharing a spool_dir
+	// would race on the same queue files, so refuse to start if another
+	// process holds the lock.
+	lock, err := lockSpool(m.SpoolDir)
+	if err != nil {
+		return fmt.Errorf("mta: %w", err)
+	}
+	m.spoolLock = lock
+
 	m.stopCh = make(chan struct{})
+	m.globalSem = make(chan struct{}, m.Concurrency)
+	// Guard against Start being reached without Provision (which normally
+	// creates these); a nil map would panic on the first write.
+	if m.mxCache == nil {
+		m.mxCache = make(map[string]mxCacheEntry)
+	}
+	if m.mxSem == nil {
+		m.mxSem = make(map[string]chan struct{})
+	}
+	if m.notifyCh == nil {
+		m.notifyCh = make(chan shared.DeliveryEvent, notifyBuffer)
+	}
+	if size, err := shared.SpoolSize(m.SpoolDir); err == nil {
+		m.spoolBytes.Store(size)
+	}
 
 	recovered := shared.RecoverActive(m.SpoolDir, 2*time.Duration(m.ConnectTimeout))
 	if recovered > 0 {
-		m.log.Info("mta: recovered active messages", zap.Int("count", recovered))
+		m.logger().Info("mta: recovered active messages", zap.Int("count", recovered))
 	}
 
 	if m.NotifyURL != "" {
@@ -192,16 +265,88 @@ func (m *MTA) Start() error {
 
 	m.wg.Add(1)
 	go m.loop()
+	m.wg.Add(1)
+	go m.janitor()
 	return nil
 }
 
 func (m *MTA) Stop() error {
-	close(m.stopCh)
-	m.wg.Wait()
+	if m.stopCh == nil {
+		return nil
+	}
+	m.stopOnce.Do(func() { close(m.stopCh) })
+
+	// Wait for in-flight deliveries, but not forever: a reload or shutdown
+	// must not block for the whole command_timeout.
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
+	timeout := time.Duration(m.ShutdownTimeout)
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		m.logger().Warn("mta: shutdown timed out; abandoning in-flight deliveries",
+			zap.Duration("timeout", timeout))
+	}
+
+	if m.spoolLock != nil {
+		m.spoolLock.Close()
+		m.spoolLock = nil
+	}
 	return nil
 }
 
-// Enqueue implements shared.Enqueuer; delegates to the package function.
+// janitor periodically recomputes the spool size for quota accounting and
+// prunes expired bounce archives so they cannot grow without bound.
+func (m *MTA) janitor() {
+	defer m.wg.Done()
+	ticker := time.NewTicker(spoolJanitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-ticker.C:
+			if size, err := shared.SpoolSize(m.SpoolDir); err == nil {
+				m.spoolBytes.Store(size)
+			}
+			if r := time.Duration(m.BounceRetention); r > 0 {
+				if n := shared.PruneBounce(m.SpoolDir, time.Now().Add(-r)); n > 0 {
+					m.logger().Info("mta: pruned bounce archive", zap.Int("files", n))
+				}
+			}
+		}
+	}
+}
+
+// Enqueue implements shared.Enqueuer; delegates to the package function after
+// enforcing the spool quota.
 func (m *MTA) Enqueue(_ context.Context, env *shared.Envelope, raw []byte) (string, error) {
-	return shared.Enqueue(m.SpoolDir, env, raw)
+	if err := m.checkQuota(int64(len(raw))); err != nil {
+		return "", err
+	}
+	id, err := shared.Enqueue(m.SpoolDir, env, raw)
+	if err != nil {
+		return "", err
+	}
+	m.spoolBytes.Add(int64(len(raw)))
+	return id, nil
+}
+
+// checkQuota rejects a message that would push the spool past max_spool_bytes.
+// The size is an approximation refreshed by the janitor and incremented on
+// every accepted message.
+func (m *MTA) checkQuota(incoming int64) error {
+	if m.MaxSpoolBytes <= 0 {
+		return nil
+	}
+	if m.spoolBytes.Load()+incoming > m.MaxSpoolBytes {
+		return shared.ErrSpoolFull
+	}
+	return nil
 }

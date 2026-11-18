@@ -41,6 +41,22 @@ func (c *fakeConn) SetDeadline(t time.Time) error      { return nil }
 func (c *fakeConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *fakeConn) SetWriteDeadline(t time.Time) error { return nil }
 
+func TestSMTPValidateNumeric(t *testing.T) {
+	t.Parallel()
+	for name, lc := range map[string]*ListenerConfig{
+		"max_connections": {Port: 25, MaxConnections: -1},
+		"max_message":     {Port: 25, MaxMessageSize: -1},
+		"max_recipients":  {Port: 25, MaxRecipients: -1},
+	} {
+		if err := (&SMTP{Listeners: []*ListenerConfig{lc}}).Validate(); err == nil {
+			t.Errorf("expected error for negative %s", name)
+		}
+	}
+	if err := (&SMTP{Listeners: []*ListenerConfig{{Port: 25}}}).Validate(); err != nil {
+		t.Errorf("zero-valued limits should validate, got %v", err)
+	}
+}
+
 func TestSplitCmd(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -113,6 +129,9 @@ func TestSessionEHLO(t *testing.T) {
 	}
 	if !strings.Contains(out, "ENHANCEDSTATUSCODES") {
 		t.Error("expected ENHANCEDSTATUSCODES capability")
+	}
+	if !strings.Contains(out, "8BITMIME") {
+		t.Error("expected 8BITMIME capability")
 	}
 	if strings.Contains(out, "STARTTLS") {
 		t.Error("should not advertise STARTTLS when off")
@@ -199,6 +218,78 @@ func TestSessionDataTooLarge(t *testing.T) {
 	out := conn.Buffer.String()
 	if !strings.Contains(out, "552") {
 		t.Error("expected 552 message too large, got:", out)
+	}
+}
+
+func TestSessionDataTooLargeDrainsBody(t *testing.T) {
+	t.Parallel()
+	conn := newFakeConn()
+	conn.Buffer.WriteString(
+		"EHLO test\r\n" +
+			"MAIL FROM:<a@b>\r\n" +
+			"RCPT TO:<c@d>\r\n" +
+			"DATA\r\n" +
+			strings.Repeat("x", 100) + "\r\n" +
+			"MORE BODY\r\n" +
+			".\r\n" +
+			"NOOP\r\n" +
+			"QUIT\r\n",
+	)
+	lc := &ListenerConfig{
+		Port:           25,
+		Hostname:       "mail.test",
+		MaxMessageSize: 50,
+		MaxRecipients:  50,
+		TLS:            "off",
+	}
+	s := newSession(lc, conn)
+	s.run()
+	out := conn.Buffer.String()
+	if !strings.Contains(out, "552") {
+		t.Fatalf("expected 552 message too large, got: %s", out)
+	}
+	// The leftover body must be drained, not interpreted as commands.
+	if strings.Contains(out, "500") {
+		t.Errorf("leftover DATA body was parsed as commands: %s", out)
+	}
+	if !strings.Contains(out, "250 OK") {
+		t.Errorf("expected NOOP to be answered after the aborted DATA: %s", out)
+	}
+}
+
+func TestSessionDataTooLargeDropsFloodingClient(t *testing.T) {
+	t.Parallel()
+	conn := newFakeConn()
+	var flood strings.Builder
+	for i := 0; i < 10; i++ {
+		flood.WriteString("AAAAAAAAAA\r\n") // 12 bytes each, never terminated
+	}
+	conn.Buffer.WriteString(
+		"EHLO test\r\n" +
+			"MAIL FROM:<a@b>\r\n" +
+			"RCPT TO:<c@d>\r\n" +
+			"DATA\r\n" +
+			strings.Repeat("x", 100) + "\r\n" +
+			flood.String() +
+			"NOOP\r\n" +
+			"QUIT\r\n",
+	)
+	lc := &ListenerConfig{
+		Port:           25,
+		Hostname:       "mail.test",
+		MaxMessageSize: 50,
+		MaxRecipients:  50,
+		TLS:            "off",
+	}
+	s := newSession(lc, conn)
+	s.run()
+	out := conn.Buffer.String()
+	if !strings.Contains(out, "552") {
+		t.Fatalf("expected 552 message too large, got: %s", out)
+	}
+	// The connection must be dropped rather than reading an unbounded body.
+	if !strings.HasSuffix(strings.TrimRight(out, "\r\n"), "Message too large") {
+		t.Errorf("session continued after an oversized flood: %s", out)
 	}
 }
 

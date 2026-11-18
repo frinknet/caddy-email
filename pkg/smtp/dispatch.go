@@ -64,7 +64,7 @@ func (s *session) buildRequest(raw []byte) *http.Request {
 	req := &http.Request{
 		Method:     http.MethodPost,
 		URL:        &url.URL{Path: "/", Scheme: "http"},
-		Host:       s.helo,
+		Host:       s.lc.Hostname,
 		Proto:      "HTTP/1.1",
 		ProtoMajor: 1,
 		ProtoMinor: 1,

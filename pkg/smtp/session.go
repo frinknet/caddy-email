@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
 )
@@ -22,6 +23,10 @@ type session struct {
 	from  string
 	rcpts []string
 	tlsOn bool
+
+	// closing is set when the peer must be disconnected after the current
+	// command (for example after it keeps streaming an oversized body).
+	closing bool
 }
 
 func newSession(lc *ListenerConfig, conn net.Conn) *session {
@@ -40,6 +45,9 @@ func newSession(lc *ListenerConfig, conn net.Conn) *session {
 
 func (s *session) replyf(format string, args ...any) {
 	fmt.Fprintf(s.writer, format+"\r\n", args...)
+	if d := time.Duration(s.lc.DeliverTimeout); d > 0 {
+		s.conn.SetWriteDeadline(time.Now().Add(d))
+	}
 	s.writer.Flush()
 }
 
@@ -47,9 +55,20 @@ func (s *session) reply(code int, msg string) {
 	s.replyf("%d %s", code, msg)
 }
 
+// refreshDeadline rearms the read deadline before every blocking read. This
+// bounds an idle client without killing a slow-but-active transfer: session
+// length is unlimited as long as data keeps arriving within DeliverTimeout.
+func (s *session) refreshDeadline() {
+	if d := time.Duration(s.lc.DeliverTimeout); d > 0 {
+		s.conn.SetReadDeadline(time.Now().Add(d))
+	}
+}
+
 func (s *session) run() {
+	s.refreshDeadline()
 	s.replyf("220 %s ESMTP ready", s.lc.Hostname)
 	for {
+		s.refreshDeadline()
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
 			return
@@ -84,6 +103,9 @@ func (s *session) run() {
 		default:
 			s.reply(500, "Unknown command")
 		}
+		if s.closing {
+			return
+		}
 	}
 }
 
@@ -98,6 +120,7 @@ func (s *session) handleEHLO(args string) {
 	}
 	caps = append(caps, "PIPELINING")
 	caps = append(caps, "ENHANCEDSTATUSCODES")
+	caps = append(caps, "8BITMIME")
 	if s.lc.TLS == "starttls" && !s.tlsOn {
 		caps = append(caps, "STARTTLS")
 	}
@@ -156,6 +179,7 @@ func (s *session) handleData() {
 	s.reply(354, "End with <CRLF>.<CRLF>")
 	var body bytes.Buffer
 	for {
+		s.refreshDeadline()
 		line, err := s.reader.ReadString('\n')
 		if err != nil {
 			return
@@ -166,8 +190,13 @@ func (s *session) handleData() {
 		if strings.HasPrefix(line, "..") {
 			line = line[1:]
 		}
-		if int64(body.Len())+int64(len(line)) > s.lc.MaxMessageSize {
-			s.reply(552, "Message too large")
+		if s.lc.MaxMessageSize > 0 && int64(body.Len())+int64(len(line)) > s.lc.MaxMessageSize {
+			s.reply(552, "5.3.4 Message too large")
+			// Drain the rest of DATA so the remaining body lines are not
+			// parsed as SMTP commands, then abort the transaction.
+			s.drainData()
+			s.from = ""
+			s.rcpts = nil
 			return
 		}
 		body.WriteString(line)
@@ -175,6 +204,32 @@ func (s *session) handleData() {
 	s.dispatch(body.Bytes())
 	s.from = ""
 	s.rcpts = nil
+}
+
+// drainData consumes lines until the end-of-data terminator, so that after an
+// early 552 the leftover body is not misinterpreted as commands. If the peer
+// keeps streaming past the message limit, the session is marked for closing
+// instead of reading an unbounded body.
+func (s *session) drainData() {
+	var drained int64
+	limit := s.lc.MaxMessageSize
+	for {
+		s.refreshDeadline()
+		line, err := s.reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if line == ".\r\n" || line == ".\n" {
+			return
+		}
+		if limit > 0 {
+			drained += int64(len(line))
+			if drained > limit {
+				s.closing = true
+				return
+			}
+		}
+	}
 }
 
 func (s *session) handleSTARTTLS() {

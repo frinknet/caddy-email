@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -19,6 +20,26 @@ func TestSendmailServeHTTP_RejectsNonPost(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "405") {
 		t.Errorf("expected 405, got %v", err)
+	}
+}
+
+func TestSendmailServeHTTP_RejectsOversizedChunkedBody(t *testing.T) {
+	s := &Sendmail{MaxBodySize: 10}
+	w := httptest.NewRecorder()
+	r := &http.Request{
+		Method: http.MethodPost,
+		Header: http.Header{
+			"Content-Type": {"text/plain"},
+			"From":         {"a@b.com"},
+			"To":           {"c@d.com"},
+		},
+		Body: io.NopCloser(strings.NewReader(strings.Repeat("x", 100))),
+		// ContentLength -1 models a chunked upload with no declared length.
+		ContentLength: -1,
+	}
+	err := s.ServeHTTP(w, r, nil)
+	if err == nil || !strings.Contains(err.Error(), "413") {
+		t.Fatalf("expected 413 for oversized chunked body, got %v", err)
 	}
 }
 
@@ -104,9 +125,9 @@ func TestSendmailParseRequest_RFC822(t *testing.T) {
 	r := &http.Request{
 		Method: http.MethodPost,
 		Header: http.Header{
-			"Content-Type":    {"message/rfc822"},
-			"From": {"env@test.com"},
-			"To":   {"rcpt@test.com"},
+			"Content-Type": {"message/rfc822"},
+			"From":         {"env@test.com"},
+			"To":           {"rcpt@test.com"},
 		},
 		Body: io.NopCloser(bytes.NewReader([]byte(rawBody))),
 	}
@@ -142,10 +163,10 @@ func TestSendmailParseRequest_TextPlain(t *testing.T) {
 	r := &http.Request{
 		Method: http.MethodPost,
 		Header: http.Header{
-			"Content-Type":   {"text/plain"},
-			"From": {"sender@test.com"},
-			"To":   {"rcpt1@test.com, rcpt2@test.com"},
-			"Subject":       {"Test Subject"},
+			"Content-Type": {"text/plain"},
+			"From":         {"sender@test.com"},
+			"To":           {"rcpt1@test.com, rcpt2@test.com"},
+			"Subject":      {"Test Subject"},
 		},
 		Body: io.NopCloser(bytes.NewReader([]byte(body))),
 	}
@@ -174,8 +195,8 @@ func TestSendmailParseRequest_TextPlainDefaults(t *testing.T) {
 	r := &http.Request{
 		Method: http.MethodPost,
 		Header: http.Header{
-			"Content-Type":   {"text/plain"},
-			"To":   {"rcpt@test.com"},
+			"Content-Type": {"text/plain"},
+			"To":           {"rcpt@test.com"},
 		},
 		Body: io.NopCloser(bytes.NewReader([]byte(body))),
 	}
@@ -199,7 +220,7 @@ func TestSendmailParseRequest_TextPlainMissingFrom(t *testing.T) {
 		Method: http.MethodPost,
 		Header: http.Header{
 			"Content-Type": {"text/plain"},
-			"To": {"rcpt@test.com"},
+			"To":           {"rcpt@test.com"},
 		},
 		Body: io.NopCloser(bytes.NewReader([]byte(body))),
 	}
@@ -215,7 +236,7 @@ func TestSendmailParseRequest_TextPlainMissingTo(t *testing.T) {
 		Method: http.MethodPost,
 		Header: http.Header{
 			"Content-Type": {"text/plain"},
-			"From": {"a@b.com"},
+			"From":         {"a@b.com"},
 		},
 		Body: io.NopCloser(bytes.NewReader([]byte("body"))),
 	}
@@ -230,9 +251,9 @@ func TestSendmailParseRequest_EmptyContentType(t *testing.T) {
 	r := &http.Request{
 		Method: http.MethodPost,
 		Header: http.Header{
-			"From": {"a@b.com"},
-			"To":   {"c@d.com"},
-			"Subject":       {"Hi"},
+			"From":    {"a@b.com"},
+			"To":      {"c@d.com"},
+			"Subject": {"Hi"},
 		},
 		Body: io.NopCloser(bytes.NewReader([]byte("body"))),
 	}
@@ -254,8 +275,8 @@ func TestSendmailParseRequest_CcAndBcc(t *testing.T) {
 		Method: http.MethodPost,
 		Header: http.Header{
 			"Content-Type": {"text/plain"},
-			"From":    {"a@b.com"},
-			"To":      {"b@b.com"},
+			"From":         {"a@b.com"},
+			"To":           {"b@b.com"},
 			"Cc":           {"c@c.com, c2@c2.com"},
 			"Bcc":          {"d@d.com"},
 		},
@@ -287,7 +308,7 @@ func TestSendmailParseRequest_CcOnly(t *testing.T) {
 		Method: http.MethodPost,
 		Header: http.Header{
 			"From": {"a@b.com"},
-			"Cc":        {"c@c.com"},
+			"Cc":   {"c@c.com"},
 		},
 		Body: io.NopCloser(bytes.NewReader([]byte("body"))),
 	}
@@ -306,7 +327,7 @@ func TestSendmailParseRequest_BccOnly(t *testing.T) {
 		Method: http.MethodPost,
 		Header: http.Header{
 			"From": {"a@b.com"},
-			"Bcc":       {"d@d.com"},
+			"Bcc":  {"d@d.com"},
 		},
 		Body: io.NopCloser(bytes.NewReader([]byte("body"))),
 	}
@@ -334,9 +355,9 @@ func TestSendmailParseRequest_ReplyTo(t *testing.T) {
 	r := &http.Request{
 		Method: http.MethodPost,
 		Header: http.Header{
-			"From": {"a@b.com"},
-			"To":   {"b@b.com"},
-			"Reply-To":  {"support@example.com"},
+			"From":     {"a@b.com"},
+			"To":       {"b@b.com"},
+			"Reply-To": {"support@example.com"},
 		},
 		Body: io.NopCloser(bytes.NewReader([]byte("body"))),
 	}
@@ -372,6 +393,81 @@ func TestSendmailParseRequest_FormCcBccReplyTo(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), "Reply-To: support@x.com") {
 		t.Error("missing Reply-To in message")
+	}
+}
+
+func TestSendmailParseRequest_FormSubjectHeaderInjection(t *testing.T) {
+	s := &Sendmail{DefaultFrom: "a@b.com"}
+	// %0d%0a decodes to CRLF, which would otherwise start a new header.
+	body := "to=c@d.com&subject=Hi%0d%0aBcc%3A%20evil@x.com&body=x"
+	r := &http.Request{
+		Method: http.MethodPost,
+		Header: http.Header{"Content-Type": {"application/x-www-form-urlencoded"}},
+		Body:   io.NopCloser(bytes.NewReader([]byte(body))),
+	}
+	_, _, err := s.parseRequest(r)
+	if err == nil {
+		t.Fatal("expected error for CRLF in subject")
+	}
+}
+
+func TestSendmailParseRequest_FormAddressHeaderInjection(t *testing.T) {
+	s := &Sendmail{DefaultFrom: "a@b.com"}
+	body := "to=c@d.com%0d%0aBcc%3A%20evil@x.com&body=x"
+	r := &http.Request{
+		Method: http.MethodPost,
+		Header: http.Header{"Content-Type": {"application/x-www-form-urlencoded"}},
+		Body:   io.NopCloser(bytes.NewReader([]byte(body))),
+	}
+	_, _, err := s.parseRequest(r)
+	if err == nil {
+		t.Fatal("expected error for CRLF in recipient address")
+	}
+}
+
+func TestSendmailParseRequest_FormInvalidAddress(t *testing.T) {
+	s := &Sendmail{DefaultFrom: "a@b.com"}
+	body := "to=not-an-address&body=x"
+	r := &http.Request{
+		Method: http.MethodPost,
+		Header: http.Header{"Content-Type": {"application/x-www-form-urlencoded"}},
+		Body:   io.NopCloser(bytes.NewReader([]byte(body))),
+	}
+	if _, _, err := s.parseRequest(r); err == nil {
+		t.Fatal("expected error for invalid recipient address")
+	}
+}
+
+func TestSendmailParseRequest_FormIgnoresQueryParams(t *testing.T) {
+	s := &Sendmail{DefaultFrom: "a@b.com"}
+	// The envelope sender must come from the POST body, not the query string.
+	r := &http.Request{
+		Method: http.MethodPost,
+		URL:    &url.URL{RawQuery: "from=attacker@evil.com"},
+		Header: http.Header{"Content-Type": {"application/x-www-form-urlencoded"}},
+		Body:   io.NopCloser(bytes.NewReader([]byte("to=c@d.com&body=x"))),
+	}
+	env, _, err := s.parseRequest(r)
+	if err != nil {
+		t.Fatalf("parseRequest: %v", err)
+	}
+	if env.From != "a@b.com" {
+		t.Errorf("From = %q, want the configured default", env.From)
+	}
+}
+
+func TestSendmailParseRequest_HeaderAddressInjection(t *testing.T) {
+	s := &Sendmail{MaxBodySize: 30 * 1024 * 1024}
+	r := &http.Request{
+		Method: http.MethodPost,
+		Header: http.Header{
+			"From": {"a@b.com\r\nBcc: evil@x.com"},
+			"To":   {"c@d.com"},
+		},
+		Body: io.NopCloser(bytes.NewReader([]byte("body"))),
+	}
+	if _, _, err := s.parseRequest(r); err == nil {
+		t.Fatal("expected error for CRLF in From header")
 	}
 }
 
@@ -421,13 +517,13 @@ func TestSendmailAllowedFromHTTP(t *testing.T) {
 
 func TestSendmailParseTemplateDictCcBcc(t *testing.T) {
 	args := []any{map[string]any{
-		"from":    "a@b.com",
-		"to":      "b@b.com",
-		"cc":      "c@c.com",
-		"bcc":     "d@d.com",
+		"from":     "a@b.com",
+		"to":       "b@b.com",
+		"cc":       "c@c.com",
+		"bcc":      "d@d.com",
 		"reply_to": "r@r.com",
-		"subject": "Hi",
-		"body":    "Hello",
+		"subject":  "Hi",
+		"body":     "Hello",
 	}}
 	env, raw, err := parseTemplateArgs(args, "default@b.com")
 	if err != nil {

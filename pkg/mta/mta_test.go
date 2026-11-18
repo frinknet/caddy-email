@@ -1,13 +1,63 @@
 package mta
 
 import (
+	"bufio"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
 
 	"github.com/frinknet/caddy-email/pkg/shared"
 )
+
+// newSpool creates a spool directory with every state subdirectory.
+func newSpool(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, sub := range []string{
+		shared.StateIncoming, shared.StateActive, shared.StateDeferred,
+		shared.StateBounce, shared.StateCorrupt, shared.StateHold,
+	} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0700); err != nil {
+			t.Fatalf("mkdir %s: %v", sub, err)
+		}
+	}
+	return dir
+}
+
+// enqueueClaimed enqueues a job and moves it into active/, returning its ID.
+func enqueueClaimed(t *testing.T, dir string, env *shared.Envelope, body string) string {
+	t.Helper()
+	id, err := shared.Enqueue(dir, env, []byte(body))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := shared.Claim(dir, id); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	return id
+}
+
+func countPrefix(t *testing.T, dir string, prefix string) int {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read %s: %v", dir, err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), prefix) {
+			n++
+		}
+	}
+	return n
+}
 
 func TestParseDKIMKey(t *testing.T) {
 	key := `-----BEGIN PRIVATE KEY-----
@@ -62,7 +112,9 @@ func TestBuildDSN(t *testing.T) {
 func TestReEnqueue(t *testing.T) {
 	dir := t.TempDir()
 	m := &MTA{
-		SpoolDir: dir,
+		SpoolDir:   dir,
+		MaxRetries: 5,
+		log:        zap.NewNop(),
 	}
 	for _, sub := range []string{shared.StateIncoming, shared.StateActive, shared.StateDeferred} {
 		os.MkdirAll(dir+"/"+sub, 0700)
@@ -90,5 +142,461 @@ func TestReEnqueue(t *testing.T) {
 	}
 	if qfCount != 1 {
 		t.Fatalf("expected 1 qf file in deferred, got %d", qfCount)
+	}
+
+	// The re-enqueued df must hold the raw body passed in, not a signed copy.
+	for _, e := range entries {
+		if !strings.HasPrefix(e.Name(), "df") {
+			continue
+		}
+		got, err := os.ReadFile(filepath.Join(defDir, e.Name()))
+		if err != nil {
+			t.Fatalf("read %s: %v", e.Name(), err)
+		}
+		if string(got) != string(body) {
+			t.Errorf("deferred df = %q, want %q", got, body)
+		}
+	}
+}
+
+func TestMTAValidateNumeric(t *testing.T) {
+	if err := (&MTA{Concurrency: -1}).Validate(); err == nil {
+		t.Error("expected error for negative concurrency")
+	}
+	if err := (&MTA{PerMXConcurrency: -1}).Validate(); err == nil {
+		t.Error("expected error for negative per_mx_concurrency")
+	}
+	if err := (&MTA{MaxBatch: -1}).Validate(); err == nil {
+		t.Error("expected error for negative max_batch")
+	}
+	if err := (&MTA{MaxRetries: -1}).Validate(); err == nil {
+		t.Error("expected error for negative max_retries")
+	}
+
+	m := &MTA{}
+	m.applyDefaults()
+	if err := m.Validate(); err != nil {
+		t.Errorf("defaulted config should validate, got %v", err)
+	}
+}
+
+func TestSplitMultiDomain(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{shared.StateIncoming, shared.StateActive} {
+		os.MkdirAll(filepath.Join(dir, sub), 0700)
+	}
+	m := &MTA{SpoolDir: dir, log: zap.NewNop()}
+
+	id, err := shared.Enqueue(dir, &shared.Envelope{
+		From: "alice@example.com",
+		To:   []string{"one@a.com", "two@a.com", "three@b.com"},
+	}, []byte("body"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	jobs, err := shared.ScanEligible(dir, 0, 100)
+	if err != nil {
+		t.Fatalf("ScanEligible: %v", err)
+	}
+	out := m.splitMultiDomain(jobs)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 single-domain jobs, got %d: %+v", len(out), out)
+	}
+
+	counts := map[string]int{}
+	var origKept bool
+	for _, j := range out {
+		dom := recipientDomain(j.To[0])
+		for _, r := range j.To {
+			if recipientDomain(r) != dom {
+				t.Fatalf("job %s spans multiple domains: %v", j.ID, j.To)
+			}
+		}
+		counts[dom] += len(j.To)
+		if j.ID == id {
+			origKept = true
+			if dom != "a.com" {
+				t.Errorf("original job kept wrong domain: %v", j.To)
+			}
+		}
+	}
+	if counts["a.com"] != 2 || counts["b.com"] != 1 {
+		t.Fatalf("unexpected split: %v", counts)
+	}
+	if !origKept {
+		t.Error("original job ID was not preserved")
+	}
+
+	// The rewritten qf on disk must carry only the first domain's recipients.
+	data, err := os.ReadFile(filepath.Join(dir, shared.StateIncoming, "qf"+id))
+	if err != nil {
+		t.Fatalf("read rewritten qf: %v", err)
+	}
+	var rcpts []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "R") {
+			rcpts = append(rcpts, line[1:])
+		}
+	}
+	if len(rcpts) != 2 {
+		t.Fatalf("expected 2 recipients in rewritten qf, got %v", rcpts)
+	}
+}
+
+func TestFailPermanentQueuesDSN(t *testing.T) {
+	dir := newSpool(t)
+	m := &MTA{SpoolDir: dir, Hostname: "mail.test", MaxRetries: 5, log: zap.NewNop()}
+
+	id := enqueueClaimed(t, dir, &shared.Envelope{
+		From: "sender@example.com",
+		To:   []string{"rcpt@example.com"},
+	}, "body")
+	j := &shared.Job{ID: id, From: "sender@example.com", To: []string{"rcpt@example.com"}}
+
+	m.failPermanent(j, "user unknown")
+
+	// The original message is archived in bounce/.
+	if _, err := os.Stat(filepath.Join(dir, shared.StateBounce, "qf"+id)); err != nil {
+		t.Fatalf("original not archived in bounce/: %v", err)
+	}
+
+	// A DSN is queued for delivery back to the sender.
+	jobs, err := shared.ScanEligible(dir, 0, 100)
+	if err != nil {
+		t.Fatalf("ScanEligible: %v", err)
+	}
+	var dsn *shared.Job
+	for _, d := range jobs {
+		if d.From == "MAILER-DAEMON@mail.test" {
+			dsn = d
+		}
+	}
+	if dsn == nil {
+		t.Fatal("no DSN queued for the sender")
+	}
+	if len(dsn.To) != 1 || dsn.To[0] != "sender@example.com" {
+		t.Errorf("DSN recipients = %v, want [sender@example.com]", dsn.To)
+	}
+	if dsn.Meta[metaDSN] != "1" {
+		t.Errorf("DSN job not marked to prevent loops: %v", dsn.Meta)
+	}
+}
+
+func TestBounceLoopSuppressed(t *testing.T) {
+	dir := newSpool(t)
+	m := &MTA{SpoolDir: dir, Hostname: "mail.test", log: zap.NewNop()}
+
+	// A null sender must never receive a bounce.
+	id1 := enqueueClaimed(t, dir, &shared.Envelope{
+		From: "",
+		To:   []string{"rcpt@example.com"},
+	}, "body")
+	m.failPermanent(&shared.Job{ID: id1, From: "", To: []string{"rcpt@example.com"}}, "nope")
+
+	// A DSN must never generate another DSN.
+	id2 := enqueueClaimed(t, dir, &shared.Envelope{
+		From: "sender@example.com",
+		To:   []string{"rcpt@example.com"},
+		Meta: map[string]string{metaDSN: "1"},
+	}, "body")
+	m.failPermanent(&shared.Job{
+		ID: id2, From: "sender@example.com", To: []string{"rcpt@example.com"},
+		Meta: map[string]string{metaDSN: "1"},
+	}, "nope")
+
+	if n := countPrefix(t, filepath.Join(dir, shared.StateIncoming), "qf"); n != 0 {
+		t.Errorf("expected no DSN queued, found %d jobs in incoming/", n)
+	}
+	if n := countPrefix(t, filepath.Join(dir, shared.StateBounce), "qf"); n != 2 {
+		t.Errorf("expected 2 archived messages, found %d", n)
+	}
+}
+
+func TestReEnqueueExhaustedBounces(t *testing.T) {
+	dir := newSpool(t)
+	m := &MTA{SpoolDir: dir, Hostname: "mail.test", MaxRetries: 0, log: zap.NewNop()}
+
+	id := enqueueClaimed(t, dir, &shared.Envelope{
+		From: "sender@example.com",
+		To:   []string{"rcpt@example.com"},
+	}, "body")
+	j := &shared.Job{ID: id, From: "sender@example.com", To: []string{"rcpt@example.com"}, Attempts: 0}
+
+	m.reEnqueue(j, []byte("body"), []string{"rcpt@example.com"})
+
+	// Nothing should be left in deferred/; a DSN should be queued instead.
+	if n := countPrefix(t, filepath.Join(dir, shared.StateDeferred), "qf"); n != 0 {
+		t.Errorf("expected no deferred job, found %d", n)
+	}
+	if n := countPrefix(t, filepath.Join(dir, shared.StateIncoming), "qf"); n != 1 {
+		t.Errorf("expected 1 queued DSN, found %d", n)
+	}
+}
+
+func TestClassifyMX(t *testing.T) {
+	hosts, null := classifyMX([]*net.MX{{Host: ".", Pref: 0}})
+	if !null || len(hosts) != 0 {
+		t.Errorf("null MX: hosts=%v null=%v, want empty hosts and null=true", hosts, null)
+	}
+
+	hosts, null = classifyMX([]*net.MX{
+		{Host: "mx2.example.com.", Pref: 20},
+		{Host: "mx1.example.com.", Pref: 10},
+	})
+	if null {
+		t.Error("normal MX set classified as null")
+	}
+	if len(hosts) != 2 || hosts[0] != "mx1.example.com" || hosts[1] != "mx2.example.com" {
+		t.Errorf("hosts = %v, want preference order with trailing dots trimmed", hosts)
+	}
+}
+
+func TestResolveTargetNullMX(t *testing.T) {
+	orig := lookupMX
+	defer func() { lookupMX = orig }()
+	lookupMX = func(string) ([]*net.MX, error) {
+		return []*net.MX{{Host: ".", Pref: 0}}, nil
+	}
+
+	m := &MTA{MxCacheTTL: caddy.Duration(time.Minute), log: zap.NewNop()}
+	m.mxCache = map[string]mxCacheEntry{}
+	target, err := m.resolveTarget("example.com")
+	if err != nil {
+		t.Fatalf("resolveTarget: %v", err)
+	}
+	if !target.null {
+		t.Error("expected null MX target")
+	}
+}
+
+func TestResolveTargetImplicitMXOnNotFound(t *testing.T) {
+	orig := lookupMX
+	defer func() { lookupMX = orig }()
+	lookupMX = func(string) ([]*net.MX, error) {
+		return nil, &net.DNSError{Err: "no such host", Name: "example.com", IsNotFound: true}
+	}
+
+	m := &MTA{MxCacheTTL: caddy.Duration(time.Minute), log: zap.NewNop()}
+	m.mxCache = map[string]mxCacheEntry{}
+	target, err := m.resolveTarget("example.com")
+	if err != nil {
+		t.Fatalf("resolveTarget: %v", err)
+	}
+	if target.null || len(target.hosts) != 1 || target.hosts[0] != "example.com" {
+		t.Errorf("expected implicit MX to the domain itself, got %+v", target)
+	}
+}
+
+func TestResolveTargetTemporaryError(t *testing.T) {
+	orig := lookupMX
+	defer func() { lookupMX = orig }()
+	lookupMX = func(string) ([]*net.MX, error) {
+		return nil, &net.DNSError{Err: "timeout", Name: "example.com", IsTimeout: true}
+	}
+
+	m := &MTA{MxCacheTTL: caddy.Duration(time.Minute), log: zap.NewNop()}
+	m.mxCache = map[string]mxCacheEntry{}
+	if _, err := m.resolveTarget("example.com"); err == nil {
+		t.Fatal("expected temporary DNS error to surface so the job is deferred")
+	}
+}
+
+func TestGroupByMXNullBounces(t *testing.T) {
+	dir := newSpool(t)
+	m := &MTA{SpoolDir: dir, Hostname: "mail.test", MxCacheTTL: caddy.Duration(time.Minute), log: zap.NewNop()}
+	m.mxCache = map[string]mxCacheEntry{}
+
+	orig := lookupMX
+	defer func() { lookupMX = orig }()
+	lookupMX = func(string) ([]*net.MX, error) {
+		return []*net.MX{{Host: ".", Pref: 0}}, nil
+	}
+
+	id := enqueueClaimed(t, dir, &shared.Envelope{
+		From: "sender@example.com",
+		To:   []string{"rcpt@no-mail.example"},
+	}, "body")
+	j := &shared.Job{ID: id, From: "sender@example.com", To: []string{"rcpt@no-mail.example"}}
+
+	m.groupByMX([]*shared.Job{j})
+
+	if _, err := os.Stat(filepath.Join(dir, shared.StateBounce, "qf"+id)); err != nil {
+		t.Fatalf("null-MX job was not bounced: %v", err)
+	}
+	if n := countPrefix(t, filepath.Join(dir, shared.StateIncoming), "qf"); n != 1 {
+		t.Errorf("expected 1 queued DSN, found %d", n)
+	}
+}
+
+// fakeSMTP is a minimal SMTP server that accepts a single message.
+type fakeSMTP struct {
+	ln    net.Listener
+	mu    sync.Mutex
+	data  []byte
+	rcpts []string
+}
+
+func startFakeSMTP(t *testing.T) *fakeSMTP {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	f := &fakeSMTP{ln: ln}
+	go f.serve()
+	t.Cleanup(func() { ln.Close() })
+	return f
+}
+
+func (f *fakeSMTP) port() string {
+	_, port, err := net.SplitHostPort(f.ln.Addr().String())
+	if err != nil {
+		return ""
+	}
+	return port
+}
+
+func (f *fakeSMTP) serve() {
+	for {
+		conn, err := f.ln.Accept()
+		if err != nil {
+			return
+		}
+		go f.handle(conn)
+	}
+}
+
+func (f *fakeSMTP) handle(conn net.Conn) {
+	defer conn.Close()
+	br := bufio.NewReader(conn)
+	bw := bufio.NewWriter(conn)
+	write := func(s string) {
+		bw.WriteString(s + "\r\n")
+		bw.Flush()
+	}
+	write("220 fake ESMTP")
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			return
+		}
+		cmd := strings.ToUpper(strings.TrimRight(line, "\r\n"))
+		switch {
+		case strings.HasPrefix(cmd, "EHLO"):
+			bw.WriteString("250-fake\r\n250 OK\r\n")
+			bw.Flush()
+		case strings.HasPrefix(cmd, "HELO"):
+			write("250 fake")
+		case strings.HasPrefix(cmd, "MAIL"), strings.HasPrefix(cmd, "RSET"), strings.HasPrefix(cmd, "NOOP"):
+			write("250 OK")
+		case strings.HasPrefix(cmd, "RCPT"):
+			f.mu.Lock()
+			f.rcpts = append(f.rcpts, line)
+			f.mu.Unlock()
+			write("250 OK")
+		case strings.HasPrefix(cmd, "DATA"):
+			write("354 go")
+			var body []byte
+			for {
+				dl, err := br.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if dl == ".\r\n" || dl == ".\n" {
+					break
+				}
+				body = append(body, dl...)
+			}
+			f.mu.Lock()
+			f.data = body
+			f.mu.Unlock()
+			write("250 accepted")
+		case strings.HasPrefix(cmd, "QUIT"):
+			write("221 bye")
+			return
+		default:
+			write("250 OK")
+		}
+	}
+}
+
+func (f *fakeSMTP) delivered() []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.data
+}
+
+func TestDeliverOneFailover(t *testing.T) {
+	dir := newSpool(t)
+	f := startFakeSMTP(t)
+	m := &MTA{
+		SpoolDir:       dir,
+		Hostname:       "mail.test",
+		log:            zap.NewNop(),
+		ConnectTimeout: caddy.Duration(300 * time.Millisecond),
+		CommandTimeout: caddy.Duration(5 * time.Second),
+		DataTimeout:    caddy.Duration(5 * time.Second),
+		smtpPort:       f.port(),
+	}
+
+	id := enqueueClaimed(t, dir, &shared.Envelope{
+		From: "a@b.com",
+		To:   []string{"c@d.com"},
+	}, "From: a@b.com\r\nTo: c@d.com\r\n\r\nhello world")
+	j := &shared.Job{ID: id, From: "a@b.com", To: []string{"c@d.com"}}
+
+	// 192.0.2.1 is TEST-NET-1 and never answers; delivery must fail over to
+	// the working host rather than give up on the first MX.
+	m.deliverOne([]string{"192.0.2.1", "127.0.0.1"}, j)
+
+	if _, err := os.Stat(filepath.Join(dir, shared.StateActive, "qf"+id)); !os.IsNotExist(err) {
+		t.Fatalf("job not unlinked after failover delivery: %v", err)
+	}
+	if body := f.delivered(); !strings.Contains(string(body), "hello world") {
+		t.Errorf("body not delivered over failover: %q", body)
+	}
+}
+
+func TestDeliverOneRequireTLSDefers(t *testing.T) {
+	dir := newSpool(t)
+	f := startFakeSMTP(t)
+	m := &MTA{
+		SpoolDir:       dir,
+		Hostname:       "mail.test",
+		log:            zap.NewNop(),
+		RequireTLS:     true,
+		ConnectTimeout: caddy.Duration(2 * time.Second),
+		CommandTimeout: caddy.Duration(5 * time.Second),
+		DataTimeout:    caddy.Duration(5 * time.Second),
+		MaxRetries:     5,
+		smtpPort:       f.port(),
+	}
+
+	id := enqueueClaimed(t, dir, &shared.Envelope{
+		From: "a@b.com",
+		To:   []string{"c@d.com"},
+	}, "body")
+	j := &shared.Job{ID: id, From: "a@b.com", To: []string{"c@d.com"}}
+
+	m.deliverOne([]string{"127.0.0.1"}, j)
+
+	if n := countPrefix(t, filepath.Join(dir, shared.StateDeferred), "qf"); n != 1 {
+		t.Fatalf("expected the job to be deferred when TLS is required, found %d deferred", n)
+	}
+}
+
+func TestCheckQuota(t *testing.T) {
+	m := &MTA{MaxSpoolBytes: 100}
+	m.spoolBytes.Store(90)
+	if err := m.checkQuota(5); err != nil {
+		t.Errorf("checkQuota(5) with 90/100 used = %v, want nil", err)
+	}
+	if err := m.checkQuota(20); err != shared.ErrSpoolFull {
+		t.Errorf("checkQuota(20) with 90/100 used = %v, want ErrSpoolFull", err)
+	}
+	m.MaxSpoolBytes = 0
+	if err := m.checkQuota(1 << 40); err != nil {
+		t.Errorf("unlimited quota rejected a message: %v", err)
 	}
 }

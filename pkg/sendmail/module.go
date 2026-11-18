@@ -2,6 +2,7 @@ package sendmail
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -62,11 +63,20 @@ func (s *Sendmail) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp
 	if r.Method != http.MethodPost {
 		return caddyhttp.Error(http.StatusMethodNotAllowed, nil)
 	}
-	if s.MaxBodySize > 0 && r.ContentLength > 0 && r.ContentLength > s.MaxBodySize {
-		return caddyhttp.Error(http.StatusRequestEntityTooLarge, nil)
+	if s.MaxBodySize > 0 {
+		if r.ContentLength > s.MaxBodySize {
+			return caddyhttp.Error(http.StatusRequestEntityTooLarge, nil)
+		}
+		// Cap the body even when Content-Length is absent (chunked), so an
+		// oversized streaming upload cannot slip past as a truncated message.
+		r.Body = http.MaxBytesReader(w, r.Body, s.MaxBodySize)
 	}
 	env, raw, err := s.parseRequest(r)
 	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.Is(err, errBodyTooLarge) || errors.As(err, &maxErr) {
+			return caddyhttp.Error(http.StatusRequestEntityTooLarge, err)
+		}
 		return caddyhttp.Error(http.StatusBadRequest, err)
 	}
 	if len(s.AllowedFrom) > 0 {
@@ -81,6 +91,25 @@ func (s *Sendmail) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	return json.NewEncoder(w).Encode(map[string]string{"queue_id": id})
+}
+
+// errBodyTooLarge is returned when a request body exceeds MaxBodySize.
+var errBodyTooLarge = errors.New("request body exceeds max_body_size")
+
+// readLimited reads a body up to limit bytes and fails instead of silently
+// truncating when it is larger. limit <= 0 means unlimited.
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		return io.ReadAll(r)
+	}
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, errBodyTooLarge
+	}
+	return data, nil
 }
 
 func (s *Sendmail) isAllowedSender(sender string) bool {
@@ -115,17 +144,24 @@ func (s *Sendmail) parseRequest(r *http.Request) (*shared.Envelope, []byte, erro
 	ct := r.Header.Get("Content-Type")
 	switch {
 	case strings.HasPrefix(ct, "message/rfc822"):
-		env := &shared.Envelope{
-			From: r.Header.Get("From"),
-			To:   []string{r.Header.Get("To")},
+		from := r.Header.Get("From")
+		if from == "" {
+			from = s.DefaultFrom
 		}
-		if env.From == "" {
-			env.From = s.DefaultFrom
-		}
-		if env.From == "" {
+		if from == "" {
 			return nil, nil, fmt.Errorf("missing From header")
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, s.MaxBodySize))
+		env := &shared.Envelope{From: from}
+		env.To = append(env.To, splitAddressList(r.Header.Get("To"))...)
+		env.To = append(env.To, splitAddressList(r.Header.Get("Cc"))...)
+		env.To = append(env.To, splitAddressList(r.Header.Get("Bcc"))...)
+		if len(env.To) == 0 {
+			return nil, nil, fmt.Errorf("missing recipients (To, Cc, or Bcc header)")
+		}
+		if err := validateEnvelope(env); err != nil {
+			return nil, nil, err
+		}
+		body, err := readLimited(r.Body, s.MaxBodySize)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -141,7 +177,7 @@ func (s *Sendmail) parseRequest(r *http.Request) (*shared.Envelope, []byte, erro
 		}
 		return s.parseForm(r)
 	case ct == "" || strings.HasPrefix(ct, "text/"):
-		body, err := io.ReadAll(io.LimitReader(r.Body, s.MaxBodySize))
+		body, err := readLimited(r.Body, s.MaxBodySize)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -150,8 +186,39 @@ func (s *Sendmail) parseRequest(r *http.Request) (*shared.Envelope, []byte, erro
 	return nil, nil, fmt.Errorf("unsupported content-type: %s", ct)
 }
 
+// splitAddressList splits a comma-separated address header into individual
+// addresses, dropping empty entries.
+func splitAddressList(v string) []string {
+	var out []string
+	for _, one := range strings.Split(v, ",") {
+		one = strings.TrimSpace(one)
+		if one != "" {
+			out = append(out, one)
+		}
+	}
+	return out
+}
+
+// validateEnvelope rejects envelope addresses that are empty, unparseable, or
+// carry CR/LF. Both the message headers and the SMTP envelope are built from
+// these values, so a bad address must fail the request rather than reach the
+// wire.
+func validateEnvelope(env *shared.Envelope) error {
+	if !shared.ValidAddress(env.From) {
+		return fmt.Errorf("invalid from address %q", env.From)
+	}
+	for _, rcpt := range env.To {
+		if !shared.ValidAddress(rcpt) {
+			return fmt.Errorf("invalid recipient address %q", rcpt)
+		}
+	}
+	return nil
+}
+
 func (s *Sendmail) parseForm(r *http.Request) (*shared.Envelope, []byte, error) {
-	from := r.FormValue("from")
+	// PostForm, not Form: query parameters must not be able to set envelope
+	// fields or message headers.
+	from := r.PostFormValue("from")
 	if from == "" {
 		from = s.DefaultFrom
 	}
@@ -161,7 +228,7 @@ func (s *Sendmail) parseForm(r *http.Request) (*shared.Envelope, []byte, error) 
 
 	collect := func(key string) []string {
 		var out []string
-		for _, v := range r.Form[key] {
+		for _, v := range r.PostForm[key] {
 			for _, one := range strings.Split(v, ",") {
 				one = strings.TrimSpace(one)
 				if one != "" {
@@ -185,32 +252,22 @@ func (s *Sendmail) parseForm(r *http.Request) (*shared.Envelope, []byte, error) 
 	env.To = append(env.To, cc...)
 	env.To = append(env.To, bcc...)
 
-	replyTo := r.FormValue("reply-to")
-	subject := r.FormValue("subject")
-	body := r.FormValue("body")
+	replyTo := r.PostFormValue("reply-to")
+	subject := r.PostFormValue("subject")
+	body := r.PostFormValue("body")
 
-	// Build RFC 5322 message — Bcc is NOT written into headers
-	var b strings.Builder
-	b.WriteString("From: " + from + "\r\n")
-	if len(to) > 0 {
-		b.WriteString("To: " + strings.Join(to, ", ") + "\r\n")
+	if err := validateEnvelope(env); err != nil {
+		return nil, nil, err
 	}
-	if len(cc) > 0 {
-		b.WriteString("Cc: " + strings.Join(cc, ", ") + "\r\n")
+	if replyTo != "" && !shared.ValidAddress(replyTo) {
+		return nil, nil, fmt.Errorf("invalid reply-to address %q", replyTo)
 	}
-	if replyTo != "" {
-		b.WriteString("Reply-To: " + replyTo + "\r\n")
+	if !shared.ValidHeaderValue(subject) {
+		return nil, nil, fmt.Errorf("invalid subject: contains CR or LF")
 	}
-	if subject != "" {
-		b.WriteString("Subject: " + subject + "\r\n")
-	}
-	b.WriteString("Date: " + time.Now().Format(time.RFC1123Z) + "\r\n")
-	b.WriteString("MIME-Version: 1.0\r\n")
-	b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
-	b.WriteString("\r\n")
-	b.WriteString(body)
 
-	return env, []byte(b.String()), nil
+	// Build RFC 5322 message — Bcc is NOT written into headers.
+	return env, shared.BuildMessage(from, to, cc, replyTo, subject, body), nil
 }
 
 func (s *Sendmail) parseHeaders(r *http.Request, body []byte) (*shared.Envelope, []byte, error) {
@@ -220,6 +277,9 @@ func (s *Sendmail) parseHeaders(r *http.Request, body []byte) (*shared.Envelope,
 	}
 	if from == "" {
 		return nil, nil, fmt.Errorf("missing From header")
+	}
+	if !shared.ValidAddress(from) {
+		return nil, nil, fmt.Errorf("invalid From header %q", from)
 	}
 
 	collect := func(key string) []string {
@@ -243,10 +303,16 @@ func (s *Sendmail) parseHeaders(r *http.Request, body []byte) (*shared.Envelope,
 	if len(env.To) == 0 {
 		return nil, nil, fmt.Errorf("missing recipients (To, Cc, or Bcc header)")
 	}
+	if err := validateEnvelope(env); err != nil {
+		return nil, nil, err
+	}
 
 	subject := r.Header.Get("Subject")
 	if subject == "" {
 		subject = s.DefaultSubject
+	}
+	if !shared.ValidHeaderValue(subject) {
+		return nil, nil, fmt.Errorf("invalid Subject header: contains CR or LF")
 	}
 
 	// Build RFC 5322 message from HTTP headers.
@@ -265,7 +331,7 @@ func (s *Sendmail) parseHeaders(r *http.Request, body []byte) (*shared.Envelope,
 		if kl == "bcc" || kl == "content-length" || kl == "host" || kl == "connection" || kl == "transfer-encoding" || kl == "accept" {
 			return
 		}
-		b.WriteString(name + ": " + v + "\r\n")
+		b.WriteString(name + ": " + shared.SanitizeHeaderValue(v) + "\r\n")
 	}
 
 	writeHeader("From")

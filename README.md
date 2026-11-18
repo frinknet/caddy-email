@@ -7,9 +7,10 @@ to an API. And sending was just as easy calling an API. That is the goal of `cad
    STARTTLS, SASL PLAIN, sender/recipient filtering, and routing to Caddy handlers.
 2. **Sendmail HTTP handler** (`pkg/sendmail/`) — POST email via API instead of
    installing sendmail like it's 1999.
-3. **MTA Worker** (`pkg/mta/`) — outbound delivery queue with MX resolution, DKIM
-   signing, exponential backoff + jitter, partial delivery, RFC 3464 bounces, and
-   the emotional resilience to keep retrying after the 4th deferral.
+3. **MTA Worker** (`pkg/mta/`) — outbound delivery queue with MX failover,
+   DKIM signing, optional require-TLS, exponential backoff + jitter, partial
+   delivery, RFC 3464 bounces delivered back to the sender, and the emotional
+   resilience to keep retrying after the 4th deferral.
 
 ---
 
@@ -202,6 +203,11 @@ curl -X POST http://localhost:80/sendmail/ \
   -d "body=World"
 ```
 
+Form fields are read from the POST body only; query parameters are ignored.
+`from`, `to`, `cc`, `bcc`, and `reply-to` must be valid addresses, and no
+field may contain CR or LF. A request that tries to smuggle a header or a
+second recipient through a newline is rejected with `400`.
+
 **`message/rfc822`** — raw email, pass-through:
 
 ```bash
@@ -292,6 +298,12 @@ Port defaults:
 | `Client-IP` | Remote address |
 | `Smtp-TLS` | `"true"` if STARTTLS |
 
+Advertised extensions: `SIZE`, `PIPELINING`, `ENHANCEDSTATUSCODES`,
+`8BITMIME`, and `STARTTLS` when configured. No `AUTH`: this is a receive-only
+listener and all policy belongs to the route. A `552` oversized message is
+answered only after the rest of `DATA` is drained, so the remainder of the
+body is never parsed as commands.
+
 ---
 
 ## MTA Reference
@@ -299,12 +311,20 @@ Port defaults:
 ### Spool lifecycle
 
 ```
-Enqueue → incoming/ → Claim → active/ → MX:25 delivery
-                          ↓ failure (4xx)
-                       deferred/ → retry with backoff
-                          ↓ exhausted or 5xx
-                       bounce/ (RFC 3464 DSN written)
+Enqueue → incoming/ → Claim → active/ → MX hosts tried in preference order
+                          │                       │
+                          │ 4xx                   │ 5xx or retries exhausted
+                          ▼                       ▼
+                     deferred/ ──retry──▶      bounce/ (archive)
+                    (backoff + jitter)          + DSN queued to the sender
 ```
+
+Each job is delivered to a single recipient domain. If a domain's MX lookup
+fails temporarily the job is deferred; if the domain publishes a null MX
+(RFC 7505) it is bounced immediately. Failed messages are archived in
+`bounce/` and an RFC 3464 DSN is enqueued for delivery back to the envelope
+sender — bounces are never sent to the null sender `<>`, to another bounce, or
+to `MAILER-DAEMON`, so a failure loop is impossible.
 
 ### All options
 
@@ -323,6 +343,10 @@ mta {
     tick_interval       250ms
     max_batch           1000
     mx_cache_ttl        5m
+    require_tls         false        # defer unless the MX offers STARTTLS
+    max_spool_bytes     0            # 0 = unlimited; reject new mail above this
+    bounce_retention    168h         # prune bounce/ archives older than this
+    shutdown_timeout    30s          # cap on waiting for in-flight deliveries
     notify_url          https://hooks.example.com/events
     notify_secret       hush-hush    # HMAC signs webhook payloads
     dkim {
@@ -332,6 +356,17 @@ mta {
     }
 }
 ```
+
+| Option | Default | Description |
+|---|---|---|
+| `require_tls` | `false` | Refuse (defer) a host that does not offer STARTTLS |
+| `max_spool_bytes` | `0` (unlimited) | Reject new mail once the spool exceeds this many bytes |
+| `bounce_retention` | `168h` | Delete `bounce/` archive files older than this |
+| `shutdown_timeout` | `30s` | Max time `Stop` waits for in-flight deliveries |
+
+The spool is single-writer: `Start` takes an exclusive lock on `spool_dir` and
+refuses to start if another process already holds it, so two Caddy instances
+cannot race on the same queue.
 
 ### Retry
 
@@ -348,7 +383,17 @@ attempt 6: bounced (max_retries exhausted)
 
 If some RCPTs fail and others succeed, the successful ones get delivered. The
 failed ones are re-enqueued as a new deferred job — no innocent recipients
-punished for one bad address.
+punished for one bad address. If those retries are exhausted too, only the
+failed recipients are bounced.
+
+### MX failover
+
+MX hosts are tried in preference order. A host that cannot be reached, does not
+complete its greeting, or fails the `require_tls` check is skipped and the next
+one is tried; only when every host fails is the job deferred. A domain with no
+MX records falls back to its A/AAAA record (implicit MX). A domain that
+publishes a null MX (`MX 0 .`, RFC 7505) is treated as permanently
+undeliverable and bounced without a delivery attempt.
 
 ### DKIM
 
@@ -372,12 +417,18 @@ Delivered → deferred → bounced. POSTed to `notify_url` as JSON with
 {"queue_id":"5a3b...","event":"bounced","rcpt":["user@bad.com"],"attempts":6,"message":"user unknown"}
 ```
 
+A job is split so each targets a single recipient domain before delivery, so a
+message fanned out across domains produces events under one `queue_id` per
+domain. The id returned by `POST /sendmail` is the first domain's.
+
 Fire-and-forget. If your webhook is down, that's your problem now.
 
 ### Crash recovery
 
 On startup, stale `active/` files (older than `2 × connect_timeout`) are
 moved back to `incoming/` for reprocessing. Because yes, things crash.
+Deferred jobs whose `next_at` has passed are swept back into `incoming/` on
+every tick, so `deferred/` is a waiting room and not a graveyard.
 
 ---
 
@@ -388,6 +439,8 @@ moved back to `incoming/` for reprocessing. Because yes, things crash.
 | `port 25 requires explicit permit_mynetworks` | Add `permit_mynetworks` or switch to port 587 |
 | `auth=required but no auth_credentials` | Add `auth_credentials user pass` pairs |
 | `sendmail requires the mta app` | Add `mta { spool_dir ... }` global block |
+| `spool ... is locked by another instance` | Two Caddies share `spool_dir`; give each its own |
+| `spool quota exceeded` (503) | Spool is over `max_spool_bytes`; raise it or drain the queue |
 | `550 Relay not permitted` | Client IP not in `permit_mynetworks`; use port 587 with auth |
 | `invalid tls value` | Only `starttls` and `off` are accepted |
 | Messages stuck in `incoming/` | Check MTA logs, DNS resolution, that `mta` block exists |
@@ -401,7 +454,9 @@ moved back to `incoming/` for reprocessing. Because yes, things crash.
 |---|---|---|
 | Only PLAIN auth | ⏳ | Use STARTTLS |
 | Only simple/simple DKIM | ⏳ | May fail with some receivers |
-| Per-recipient DSN | ⏳ | One DSN per job |
+| One DSN per failed job | ⏳ | Lists every failed recipient in one report |
+| No MTA-STS / DANE | ⏳ | `require_tls` only enforces opportunistic STARTTLS |
+| No metrics endpoint | ⏳ | Use `notify_url` events and logs |
 | File attachments in sendmail | ⏳ | Pre-build MIME, POST as `message/rfc822` |
 | Queue inspection API | ⏳ | Read files in `spool_dir` |
 | IMAP/POP3 | ❌ | This is an MTA, not a boyfriend |

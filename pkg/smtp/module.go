@@ -101,6 +101,15 @@ func (s *SMTP) Validate() error {
 		if lc.Port == 0 {
 			return fmt.Errorf("smtp: listener port required")
 		}
+		if lc.MaxConnections < 0 {
+			return fmt.Errorf("smtp :%d max_connections must be >= 0", lc.Port)
+		}
+		if lc.MaxMessageSize < 0 {
+			return fmt.Errorf("smtp :%d max_message_size must be >= 0", lc.Port)
+		}
+		if lc.MaxRecipients < 0 {
+			return fmt.Errorf("smtp :%d max_recipients must be >= 0", lc.Port)
+		}
 		if lc.TLS != "" && lc.TLS != "starttls" && lc.TLS != "off" {
 			return fmt.Errorf("smtp :%d invalid tls value %q (must be \"starttls\" or \"off\")", lc.Port, lc.TLS)
 		}
@@ -153,10 +162,6 @@ func (s *SMTP) serve(lc *ListenerConfig, ln net.Listener) {
 		go func(c net.Conn) {
 			defer func() { <-sem }()
 			defer c.Close()
-			timeout := time.Duration(lc.DeliverTimeout)
-			if timeout > 0 {
-				c.SetDeadline(time.Now().Add(timeout))
-			}
 			newSession(lc, c).run()
 		}(conn)
 	}

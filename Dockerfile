@@ -62,7 +62,6 @@ COPY --from=build /etc/ssl/certs           /etc/ssl/certs
 COPY --from=build /usr/share/zoneinfo      /usr/share/zoneinfo
 COPY --from=build /out/caddy               /bin/caddy
 COPY --from=build /out/toybox              /bin/toybox
-COPY --chmod=755 entrypoint.sh             /bin/entrypoint.sh
 COPY             www                       /srv/www
 
 RUN ["/bin/toybox", "sh", "-c", "cd /bin && for i in $(./toybox); do if [ \"$i\" != toybox ]; then ./toybox ln -s toybox \"$i\"; fi; done && test -L /bin/sh && test -L /bin/ls"]
