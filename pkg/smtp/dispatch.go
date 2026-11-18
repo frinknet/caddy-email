@@ -18,6 +18,7 @@ import (
 // an SMTP reply code.
 func (s *session) dispatch(raw []byte) {
 	if s.lc.Route == nil {
+		metricMessages.Inc()
 		s.reply(250, "2.0.0 OK")
 		return
 	}
@@ -45,6 +46,9 @@ func (s *session) dispatch(raw []byte) {
 		return
 	}
 	code, msg := mapStatus(rrw.status)
+	if code == 250 {
+		metricMessages.Inc()
+	}
 	s.reply(code, msg)
 }
 

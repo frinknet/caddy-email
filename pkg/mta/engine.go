@@ -38,8 +38,11 @@ func (m *MTA) tick() {
 
 	// Enforce one domain per job before grouping: a multi-domain job would
 	// land in several MX groups and be delivered concurrently, duplicating
-	// copies and racing on the spool files.
-	jobs = m.splitMultiDomain(jobs)
+	// copies and racing on the spool files. With a relay every job targets the
+	// same host, so there is nothing to split.
+	if _, _, relaying := m.relaySpec(); !relaying {
+		jobs = m.splitMultiDomain(jobs)
+	}
 
 	// Claim each before grouping.
 	claimed := jobs[:0]

@@ -17,9 +17,10 @@ import (
 // and forget" contract.
 //
 // When NotifyURL is empty, the event is logged and nothing else happens.
-// That log line is the only observability surface the queue has, so it
-// fires for every event (delivered, deferred, bounced).
+// Every event also increments caddy_email_mta_events_total, so outcome counts are
+// available on the metrics endpoint even without a webhook configured.
 func (m *MTA) notify(ev shared.DeliveryEvent) {
+	metricEvents.WithLabelValues(ev.Event).Inc()
 	if m.NotifyURL == "" {
 		m.logger().Info("mta: event",
 			zap.String("queue_id", ev.QueueID),
@@ -30,6 +31,7 @@ func (m *MTA) notify(ev shared.DeliveryEvent) {
 	select {
 	case m.notifyCh <- ev:
 	default:
+		metricNotifyDropped.Inc()
 		m.logger().Warn("mta: notify buffer full, dropping event",
 			zap.String("id", ev.QueueID),
 			zap.String("event", ev.Event),

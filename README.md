@@ -344,6 +344,7 @@ mta {
     max_batch           1000
     mx_cache_ttl        5m
     require_tls         false        # defer unless the MX offers STARTTLS
+    relay               kumo.internal:2525  # forward everything to a smarthost
     max_spool_bytes     0            # 0 = unlimited; reject new mail above this
     bounce_retention    168h         # prune bounce/ archives older than this
     shutdown_timeout    30s          # cap on waiting for in-flight deliveries
@@ -360,6 +361,7 @@ mta {
 | Option | Default | Description |
 |---|---|---|
 | `require_tls` | `false` | Refuse (defer) a host that does not offer STARTTLS |
+| `relay` | none | Forward all mail to this `host[:port]` instead of resolving MX |
 | `max_spool_bytes` | `0` (unlimited) | Reject new mail once the spool exceeds this many bytes |
 | `bounce_retention` | `168h` | Delete `bounce/` archive files older than this |
 | `shutdown_timeout` | `30s` | Max time `Stop` waits for in-flight deliveries |
@@ -385,6 +387,32 @@ If some RCPTs fail and others succeed, the successful ones get delivered. The
 failed ones are re-enqueued as a new deferred job — no innocent recipients
 punished for one bad address. If those retries are exhausted too, only the
 failed recipients are bounced.
+
+### Relay (smarthost)
+
+Set `relay` to forward every outbound message to a single downstream MTA
+instead of resolving MX and delivering directly. This is the mode for handing
+all mail to a dedicated queueing and delivery engine such as KumoMTA:
+
+```caddyfile
+mta {
+    spool_dir /var/lib/caddy/spool
+    relay     kumo.internal:2525
+}
+```
+
+With a relay configured:
+
+- MX lookup is skipped entirely, so no DNS is done for recipient domains.
+- `per_mx_concurrency` limits connections to the smarthost as a whole (it is a
+  single target), which is the knob to match the downstream server's limits.
+- Multi-domain jobs are not split, since every recipient shares one target.
+- Opportunistic STARTTLS still applies, and `require_tls` still defers when the
+  smarthost offers no STARTTLS.
+- DKIM signing, retries/backoff, bounces, and webhooks are unchanged.
+
+The port defaults to 25. Authentication to the smarthost is not implemented;
+run the relay on a trusted network, or front it with something that adds auth.
 
 ### MX failover
 
@@ -432,6 +460,95 @@ every tick, so `deferred/` is a waiting room and not a graveyard.
 
 ---
 
+## Capacity
+
+These are measured microbenchmarks, not end-to-end load tests. They isolate the
+per-message CPU and disk costs so you can reason about where the ceiling is
+before you point real mail at it.
+
+Measured with `go test ./pkg/... -run '^$' -bench . -benchmem` on a 12th Gen
+Intel i3-1215U (8 threads), Linux, SSD-backed filesystem, Go 1.22:
+
+| Stage | Cost | Implied ceiling |
+|---|---|---|
+| Spool ingest (`Enqueue`, 2× fsync) | ~81 µs/message | ~12,000 msg/s, single stream |
+| Queue scan (`ScanEligible`) | ~30 µs/job | 1000-job backlog ≈ 30 ms per tick |
+| Dispatch (`scan` + `claim` + `unlink`) | ~40 µs/job | ~25,000 msg/s |
+| MIME build (`BuildMessage`) | ~2.2 µs/message | negligible |
+| SMTP command parsing (full session) | ~23 µs/session | ~44,000 sessions/s/core |
+| DKIM sign (RSA-2048), serial | ~1-2 ms/message | ~500-1000 msg/s/core |
+| DKIM sign (RSA-2048), parallel | ~0.4-0.6 ms/message | ~1,600-2,400 msg/s total |
+
+**What actually limits you**
+
+1. **DKIM is the bottleneck when enabled.** An RSA-2048 signature is ~20× the
+   cost of the spool write. Signing parallelizes across cores, but only ~3× on
+   this 8-thread box (RSA private-key ops are core-bound and the low-power cores
+   pull their weight slowly), so expect a few thousand signed messages/second,
+   not tens of thousands. Raise `concurrency` to use more cores. Disable DKIM if
+   you do not need it and spool fsync (~12,000 msg/s single stream) becomes the
+   limit.
+2. **Outbound SMTP round trips dominate in practice.** Real throughput is set by
+   how fast your recipients' MX servers accept mail, which no local benchmark
+   can tell you. `per_mx_concurrency` (default 2) is the knob for a single busy
+   destination.
+3. **Scan cost grows with queue depth.** A deep backlog costs a linear scan each
+   tick; keep `tick_interval` and `max_batch` sized so one tick drains what it
+   scans.
+
+**Knobs that move the numbers**
+
+| Goal | Setting |
+|---|---|
+| More parallel deliveries | `concurrency` (default 50) |
+| More connections to one MX | `per_mx_concurrency` (default 2) |
+| Faster backlog drain | lower `settle_delay`, raise `max_batch` |
+| Bound memory/scan cost | lower `max_batch` on a huge queue |
+
+Reproduce or re-measure on your own hardware before sizing a deployment; disk
+`fsync` latency in particular varies wildly between a local SSD, a network
+volume, and a container overlay.
+
+---
+
+## Metrics
+
+Every module registers Prometheus metrics into Caddy's metrics registry, the
+same one Caddy serves from its admin `/metrics` endpoint. No extra
+configuration is needed: if your Caddy build exposes metrics, these show up
+alongside Caddy's own.
+
+With the admin API enabled (the default), scrape the built-in endpoint:
+
+```bash
+curl -s localhost:2019/metrics | grep caddy_email
+```
+
+If you run `admin off`, mount Caddy's `metrics` handler on a route instead:
+
+```caddyfile
+:9090 {
+    metrics
+}
+```
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `caddy_email_mta_events_total` | counter | `event` (`delivered`, `deferred`, `bounced`) | Delivery outcomes emitted by the queue |
+| `caddy_email_mta_enqueued_total` | counter | | Messages accepted into the spool |
+| `caddy_email_mta_notify_dropped_total` | counter | | Webhook events dropped because the buffer was full |
+| `caddy_email_mta_spool_bytes` | gauge | | Bytes held by the spool directory |
+| `caddy_email_mta_spool_jobs` | gauge | `state` (`incoming`, `active`, `deferred`, `bounce`, `corrupt`, `hold`) | Queued jobs by spool state |
+| `caddy_email_smtp_connections_total` | counter | | Inbound SMTP connections accepted |
+| `caddy_email_smtp_messages_total` | counter | | Inbound messages accepted by the route |
+| `caddy_email_sendmail_enqueued_total` | counter | | Messages accepted by the sendmail HTTP API |
+
+The `spool_jobs` and `spool_bytes` gauges are computed at scrape time from a
+single walk of the spool, so they are always exact; a scrape on a very large
+spool costs one directory walk. The counters are exact.
+
+---
+
 ## Troubleshooting
 
 | Error | Fix |
@@ -456,7 +573,8 @@ every tick, so `deferred/` is a waiting room and not a graveyard.
 | Only simple/simple DKIM | ⏳ | May fail with some receivers |
 | One DSN per failed job | ⏳ | Lists every failed recipient in one report |
 | No MTA-STS / DANE | ⏳ | `require_tls` only enforces opportunistic STARTTLS |
-| No metrics endpoint | ⏳ | Use `notify_url` events and logs |
+| No relay authentication | ⏳ | `relay` sends unauthenticated; front it with an auth proxy |
+| Metrics endpoint | ✅ | Exposed on Caddy's `/metrics`; see Metrics |
 | File attachments in sendmail | ⏳ | Pre-build MIME, POST as `message/rfc822` |
 | Queue inspection API | ⏳ | Read files in `spool_dir` |
 | IMAP/POP3 | ❌ | This is an MTA, not a boyfriend |

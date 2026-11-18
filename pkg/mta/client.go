@@ -117,12 +117,8 @@ func (m *MTA) deliverOne(hosts []string, j *shared.Job) {
 // require_tls when configured. A non-nil error means the host is unusable for
 // this attempt and the caller should try the next one.
 func (m *MTA) connectHost(host string) (*smtp.Client, net.Conn, error) {
-	port := m.smtpPort
-	if port == "" {
-		port = "25"
-	}
 	dialer := &net.Dialer{Timeout: time.Duration(m.ConnectTimeout)}
-	conn, err := dialer.Dial("tcp", net.JoinHostPort(host, port))
+	conn, err := dialer.Dial("tcp", net.JoinHostPort(host, m.dialPort()))
 	if err != nil {
 		return nil, nil, fmt.Errorf("connect %s: %w", host, err)
 	}

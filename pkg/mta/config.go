@@ -151,6 +151,10 @@ func parseMTAOption(d *caddyfile.Dispenser, _ any) (any, error) {
 					return nil, d.Errf("require_tls: %v", err)
 				}
 				m.RequireTLS = v
+			case "relay":
+				if !d.AllArgs(&m.Relay) {
+					return nil, d.ArgErr()
+				}
 			case "max_spool_bytes":
 				if !d.NextArg() {
 					return nil, d.ArgErr()

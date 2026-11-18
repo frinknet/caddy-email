@@ -54,6 +54,10 @@ func (s *Sendmail) Provision(ctx caddy.Context) error {
 		return fmt.Errorf("sendmail: mta app does not implement shared.Enqueuer")
 	}
 	s.enq = enq
+	if err := registerMetrics(ctx.GetMetricsRegistry()); err != nil {
+		// Observability is not worth failing startup for: log and carry on.
+		s.log.Warn("sendmail: metrics registration failed", zap.Error(err))
+	}
 	return nil
 }
 
@@ -88,6 +92,7 @@ func (s *Sendmail) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp
 	if err != nil {
 		return caddyhttp.Error(http.StatusServiceUnavailable, err)
 	}
+	metricEnqueued.Inc()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	return json.NewEncoder(w).Encode(map[string]string{"queue_id": id})

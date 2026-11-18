@@ -132,11 +132,24 @@ type mxGroup struct {
 // job normally targets exactly one domain. Jobs that can never be delivered --
 // an empty recipient set, an unqualified recipient, or a null-MX domain -- are
 // failed here; jobs whose MX lookup fails temporarily are deferred.
+//
+// When a relay is configured no MX lookup happens: every job is grouped under
+// the smarthost so it is forwarded rather than delivered directly.
 func (m *MTA) groupByMX(jobs []*shared.Job) map[string]*mxGroup {
 	result := map[string]*mxGroup{}
+	relayHost, _, relaying := m.relaySpec()
 	for _, j := range jobs {
 		if len(j.To) == 0 {
 			m.failPermanent(j, "no recipients")
+			continue
+		}
+		if relaying {
+			g := result[relayKey]
+			if g == nil {
+				g = &mxGroup{hosts: []string{relayHost}, key: relayKey}
+				result[relayKey] = g
+			}
+			g.jobs = append(g.jobs, j)
 			continue
 		}
 		dom := recipientDomain(j.To[0])

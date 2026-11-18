@@ -56,6 +56,7 @@ type MTA struct {
 	NotifySecret     string         `json:"notify_secret,omitempty"`
 	MxCacheTTL       caddy.Duration `json:"mx_cache_ttl,omitempty"`
 	RequireTLS       bool           `json:"require_tls,omitempty"`
+	Relay            string         `json:"relay,omitempty"`
 	MaxSpoolBytes    int64          `json:"max_spool_bytes,omitempty"`
 	BounceRetention  caddy.Duration `json:"bounce_retention,omitempty"`
 	ShutdownTimeout  caddy.Duration `json:"shutdown_timeout,omitempty"`
@@ -112,6 +113,10 @@ func (m *MTA) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("mta: dkim: %w", err)
 		}
 		m.DKIM.parsedKey = key
+	}
+	if err := registerMetrics(ctx.GetMetricsRegistry(), m.SpoolDir); err != nil {
+		// Observability is not worth failing startup for: log and carry on.
+		m.logger().Warn("mta: metrics registration failed", zap.Error(err))
 	}
 	return nil
 }
@@ -208,6 +213,11 @@ func (m *MTA) Validate() error {
 	}
 	if m.MaxSpoolBytes < 0 {
 		return fmt.Errorf("mta: max_spool_bytes must be >= 0")
+	}
+	if m.Relay != "" {
+		if host, _, _ := m.relaySpec(); host == "" {
+			return fmt.Errorf("mta: invalid relay %q", m.Relay)
+		}
 	}
 	if m.NotifyURL != "" {
 		u, err := url.Parse(m.NotifyURL)
@@ -335,6 +345,7 @@ func (m *MTA) Enqueue(_ context.Context, env *shared.Envelope, raw []byte) (stri
 		return "", err
 	}
 	m.spoolBytes.Add(int64(len(raw)))
+	metricEnqueued.Inc()
 	return id, nil
 }
 

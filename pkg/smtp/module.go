@@ -93,6 +93,10 @@ func (s *SMTP) Provision(ctx caddy.Context) error {
 			}
 		}
 	}
+	if err := registerMetrics(ctx.GetMetricsRegistry()); err != nil {
+		// Observability is not worth failing startup for: log and carry on.
+		s.log.Warn("smtp: metrics registration failed", zap.Error(err))
+	}
 	return nil
 }
 
@@ -158,6 +162,7 @@ func (s *SMTP) serve(lc *ListenerConfig, ln net.Listener) {
 				continue
 			}
 		}
+		metricConnections.Inc()
 		sem <- struct{}{}
 		go func(c net.Conn) {
 			defer func() { <-sem }()
