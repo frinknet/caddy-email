@@ -25,11 +25,13 @@ import (
 	_ "github.com/frinknet/caddy-email/pkg/smtp"
 )
 
-func freePort(t *testing.T) int {
+// freePort asks the kernel for an unused port on the same address the server
+// will bind, so the probe cannot disagree with the real bind.
+func freePort(t *testing.T, addr string) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		t.Fatalf("find free port: %v", err)
+		t.Fatalf("find free port on %s: %v", addr, err)
 	}
 	defer ln.Close()
 	return ln.Addr().(*net.TCPAddr).Port
@@ -89,8 +91,10 @@ func smtpDeliver(t *testing.T, addr string) {
 }
 
 func TestMetricsEndToEnd(t *testing.T) {
-	httpPort := freePort(t)
-	smtpPort := freePort(t)
+	// The HTTP server binds loopback explicitly; the SMTP listener binds all
+	// interfaces (":port"). Probe the same address each will use.
+	httpPort := freePort(t, "127.0.0.1:0")
+	smtpPort := freePort(t, ":0")
 	spool := t.TempDir()
 
 	cfg := fmt.Sprintf(`{

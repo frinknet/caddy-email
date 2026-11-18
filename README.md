@@ -466,32 +466,40 @@ These are measured microbenchmarks, not end-to-end load tests. They isolate the
 per-message CPU and disk costs so you can reason about where the ceiling is
 before you point real mail at it.
 
-Measured with `go test ./pkg/... -run '^$' -bench . -benchmem` on a 12th Gen
-Intel i3-1215U (8 threads), Linux, SSD-backed filesystem, Go 1.22:
+Measured with `go test ./pkg/... -run '^$' -bench . -benchmem` inside the
+`caddy:2.11.9-builder-alpine` container (Go 1.27.4) on a 12th Gen Intel
+i3-1215U (8 threads), with the spool on the container's overlay filesystem:
 
 | Stage | Cost | Implied ceiling |
 |---|---|---|
-| Spool ingest (`Enqueue`, 2× fsync) | ~81 µs/message | ~12,000 msg/s, single stream |
-| Queue scan (`ScanEligible`) | ~30 µs/job | 1000-job backlog ≈ 30 ms per tick |
-| Dispatch (`scan` + `claim` + `unlink`) | ~40 µs/job | ~25,000 msg/s |
-| MIME build (`BuildMessage`) | ~2.2 µs/message | negligible |
-| SMTP command parsing (full session) | ~23 µs/session | ~44,000 sessions/s/core |
-| DKIM sign (RSA-2048), serial | ~1-2 ms/message | ~500-1000 msg/s/core |
-| DKIM sign (RSA-2048), parallel | ~0.4-0.6 ms/message | ~1,600-2,400 msg/s total |
+| Spool ingest (`Enqueue`, 2× fsync) | ~8.7 ms/message | ~115 msg/s, single stream |
+| Queue scan (`ScanEligible`) | ~10 µs/job | 1000-job backlog ≈ 10 ms per tick |
+| Dispatch (`scan` + `claim` + `unlink`) | ~126 µs/job | ~8,000 msg/s |
+| MIME build (`BuildMessage`) | ~0.9 µs/message | negligible |
+| SMTP command parsing (full session) | ~7.5 µs/session | ~133,000 sessions/s/core |
+| DKIM sign (RSA-2048), serial | ~0.7-0.9 ms/message | ~1,100-1,400 msg/s/core |
+| DKIM sign (RSA-2048), parallel | ~0.24-0.37 ms/message | ~2,700-4,200 msg/s total |
+
+**Spool ingest is bound by `fsync`, not by this code.** The identical benchmark
+measured ~81 µs/message (~12,000 msg/s) on a host SSD and ~8.7 ms/message
+(~115 msg/s) on the container's overlay filesystem: a ~100× swing that is
+entirely the storage layer. Treat that row as "measure your own disk". The
+CPU-bound rows are stable across environments.
 
 **What actually limits you**
 
-1. **DKIM is the bottleneck when enabled.** An RSA-2048 signature is ~20× the
-   cost of the spool write. Signing parallelizes across cores, but only ~3× on
-   this 8-thread box (RSA private-key ops are core-bound and the low-power cores
-   pull their weight slowly), so expect a few thousand signed messages/second,
-   not tens of thousands. Raise `concurrency` to use more cores. Disable DKIM if
-   you do not need it and spool fsync (~12,000 msg/s single stream) becomes the
-   limit.
+1. **Whether storage or DKIM dominates depends on your disk.** DKIM signing is a
+   fixed ~0.7-0.9 ms of CPU per RSA-2048 message; the spool `fsync` is
+   storage-dependent (81 µs on an SSD, 8.7 ms on overlayfs). Fast storage makes
+   DKIM the bottleneck; slow storage makes `fsync` the bottleneck. Signing
+   parallelizes across cores but only ~3× on this 8-thread box (RSA private-key
+   ops are core-bound and the low-power cores pull their weight slowly), so
+   expect thousands of signed messages/second, not tens of thousands. Raise
+   `concurrency` to use more cores.
 2. **Outbound SMTP round trips dominate in practice.** Real throughput is set by
    how fast your recipients' MX servers accept mail, which no local benchmark
    can tell you. `per_mx_concurrency` (default 2) is the knob for a single busy
-   destination.
+   destination; with `relay` set it limits connections to the smarthost.
 3. **Scan cost grows with queue depth.** A deep backlog costs a linear scan each
    tick; keep `tick_interval` and `max_batch` sized so one tick drains what it
    scans.
@@ -501,7 +509,7 @@ Intel i3-1215U (8 threads), Linux, SSD-backed filesystem, Go 1.22:
 | Goal | Setting |
 |---|---|
 | More parallel deliveries | `concurrency` (default 50) |
-| More connections to one MX | `per_mx_concurrency` (default 2) |
+| More connections to one MX (or the relay) | `per_mx_concurrency` (default 2) |
 | Faster backlog drain | lower `settle_delay`, raise `max_batch` |
 | Bound memory/scan cost | lower `max_batch` on a huge queue |
 
