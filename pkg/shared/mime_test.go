@@ -85,3 +85,71 @@ func TestPrependHeader(t *testing.T) {
 		t.Error("PrependHeader with empty header must not change the message")
 	}
 }
+
+func TestMessageID(t *testing.T) {
+	got := MessageID("alice@example.com", "ignored.example")
+	if !strings.HasPrefix(got, "<") || !strings.HasSuffix(got, "@example.com>") {
+		t.Errorf("MessageID = %q, want <...@example.com>", got)
+	}
+	if strings.ContainsAny(got, "\r\n") {
+		t.Errorf("MessageID must not contain CR or LF: %q", got)
+	}
+
+	if got := MessageID("not an address", "mail.example"); !strings.HasSuffix(got, "@mail.example>") {
+		t.Errorf("MessageID with invalid from = %q, want hostname domain", got)
+	}
+	if got := MessageID("", ""); !strings.HasSuffix(got, "@localhost>") {
+		t.Errorf("MessageID with no domain hint = %q, want localhost", got)
+	}
+
+	a, b := MessageID("alice@example.com", ""), MessageID("alice@example.com", "")
+	if a == b {
+		t.Errorf("MessageID repeated: %q", a)
+	}
+}
+
+func TestHasMessageID(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{"present", "From: a@b\r\nMessage-ID: <x@y>\r\n\r\nbody", true},
+		{"case-insensitive", "message-id: <x@y>\r\n\r\nbody", true},
+		{"absent", "From: a@b\r\nSubject: hi\r\n\r\nbody", false},
+		{"body-only", "From: a@b\r\n\r\nMessage-ID: <x@y>", false},
+		{"no-body-separator", "Subject: hi", false},
+	}
+	for _, tc := range cases {
+		if got := HasMessageID([]byte(tc.raw)); got != tc.want {
+			t.Errorf("%s: HasMessageID = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestEnsureMessageID(t *testing.T) {
+	raw := []byte("From: a@b\r\n\r\nbody")
+	got := string(EnsureMessageID(raw, "a@b.example", "mail.example"))
+	if !strings.HasPrefix(got, "Message-ID: <") {
+		t.Errorf("EnsureMessageID did not prepend a Message-ID: %q", got)
+	}
+	if !strings.HasSuffix(got, "body") {
+		t.Errorf("EnsureMessageID dropped the original message: %q", got)
+	}
+
+	withID := []byte("Message-ID: <keep@me>\r\nFrom: a@b\r\n\r\nbody")
+	if got := EnsureMessageID(withID, "a@b.example", "mail.example"); string(got) != string(withID) {
+		t.Errorf("EnsureMessageID replaced an existing Message-ID: %q", got)
+	}
+}
+
+func TestBuildersIncludeMessageID(t *testing.T) {
+	for name, raw := range map[string][]byte{
+		"BuildSimple":  BuildSimple("a@b.example", []string{"c@d.example"}, "hi", "body"),
+		"BuildMessage": BuildMessage("a@b.example", []string{"c@d.example"}, nil, "", "hi", "body"),
+	} {
+		if !HasMessageID(raw) {
+			t.Errorf("%s message has no Message-ID: %q", name, raw)
+		}
+	}
+}

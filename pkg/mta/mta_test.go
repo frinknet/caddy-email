@@ -2,6 +2,7 @@ package mta
 
 import (
 	"bufio"
+	"context"
 	"net"
 	"os"
 	"path/filepath"
@@ -145,6 +146,7 @@ func TestReEnqueue(t *testing.T) {
 	}
 
 	// The re-enqueued df must hold the raw body passed in, not a signed copy.
+	// Enqueue stamps a generated Message-ID, so only the body must survive.
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), "df") {
 			continue
@@ -153,8 +155,11 @@ func TestReEnqueue(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read %s: %v", e.Name(), err)
 		}
-		if string(got) != string(body) {
-			t.Errorf("deferred df = %q, want %q", got, body)
+		if !strings.HasSuffix(string(got), string(body)) {
+			t.Errorf("deferred df = %q, want it to end with %q", got, body)
+		}
+		if strings.Contains(string(got), "DKIM-Signature") {
+			t.Errorf("deferred df carries a signature: %q", got)
 		}
 	}
 }
@@ -674,5 +679,36 @@ func TestPruneMaps(t *testing.T) {
 	m.pruneMaps(now)
 	if _, ok := m.mxSem["held"]; !ok {
 		t.Error("in-use MX semaphore was evicted")
+	}
+}
+
+func TestEnqueueAddsMessageID(t *testing.T) {
+	dir := newSpool(t)
+	m := &MTA{SpoolDir: dir, Hostname: "mail.example"}
+	env := &shared.Envelope{From: "alice@example.com", To: []string{"bob@example.com"}}
+	body := []byte("From: alice@example.com\r\nSubject: hi\r\n\r\nbody")
+
+	id, err := m.Enqueue(context.Background(), env, body)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, shared.StateIncoming, "df"+id))
+	if err != nil {
+		t.Fatalf("read spooled message: %v", err)
+	}
+	if !shared.HasMessageID(raw) {
+		t.Errorf("enqueued message has no Message-ID: %q", raw)
+	}
+
+	id, err = m.Enqueue(context.Background(), env, []byte("Message-ID: <keep@example.com>\r\n\r\nbody"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	raw, err = os.ReadFile(filepath.Join(dir, shared.StateIncoming, "df"+id))
+	if err != nil {
+		t.Fatalf("read spooled message: %v", err)
+	}
+	if strings.Count(string(raw), "Message-ID:") != 1 || !strings.Contains(string(raw), "<keep@example.com>") {
+		t.Errorf("caller-supplied Message-ID was not preserved: %q", raw)
 	}
 }

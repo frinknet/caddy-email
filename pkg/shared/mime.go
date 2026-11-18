@@ -97,6 +97,53 @@ func traceValue(v, fallback string) string {
 	return v
 }
 
+// MessageID generates a unique RFC 5322 Message-ID, angle brackets included.
+// The right-hand side is the domain of from when it is a bare addr-spec, then
+// hostname, then "localhost", so the value is always syntactically complete.
+func MessageID(from, hostname string) string {
+	domain := "localhost"
+	if addr, ok := NormalizeAddress(from); ok {
+		if i := strings.LastIndexByte(addr, '@'); i >= 0 && i+1 < len(addr) {
+			domain = addr[i+1:]
+		}
+	} else if h := strings.TrimSpace(SanitizeHeaderValue(hostname)); h != "" {
+		domain = h
+	}
+	return "<" + newID() + "@" + domain + ">"
+}
+
+// HasMessageID reports whether the header block of raw already carries a
+// Message-ID header. The scan stops at the blank line that ends the headers, so
+// body text cannot be mistaken for one.
+func HasMessageID(raw []byte) bool {
+	for len(raw) > 0 {
+		var line []byte
+		if i := bytes.IndexByte(raw, '\n'); i >= 0 {
+			line, raw = raw[:i], raw[i+1:]
+		} else {
+			line, raw = raw, nil
+		}
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		if len(line) == 0 {
+			return false
+		}
+		if len(line) >= len("message-id:") && strings.EqualFold(string(line[:len("message-id:")]), "message-id:") {
+			return true
+		}
+	}
+	return false
+}
+
+// EnsureMessageID prepends a generated Message-ID to raw unless it already has
+// one. Every message is enqueued through it, so a sender cannot leave a message
+// without an identifier that bounces and threading can reference.
+func EnsureMessageID(raw []byte, from, hostname string) []byte {
+	if HasMessageID(raw) {
+		return raw
+	}
+	return PrependHeader(raw, "Message-ID: "+MessageID(from, hostname))
+}
+
 // PrependHeader inserts header (without its trailing CRLF) at the top of raw.
 func PrependHeader(raw []byte, header string) []byte {
 	if header == "" {
@@ -119,6 +166,7 @@ func BuildSimple(from string, to []string, subject, body string) []byte {
 		writeHeader(&b, "Subject", subject)
 	}
 	writeHeader(&b, "Date", time.Now().Format(time.RFC1123Z))
+	writeHeader(&b, "Message-ID", MessageID(from, ""))
 	writeHeader(&b, "MIME-Version", "1.0")
 	writeHeader(&b, "Content-Type", "text/plain; charset=utf-8")
 	b.WriteString("\r\n")
@@ -145,6 +193,7 @@ func BuildMessage(from string, to, cc []string, replyTo, subject, body string) [
 		writeHeader(&b, "Subject", subject)
 	}
 	writeHeader(&b, "Date", time.Now().Format(time.RFC1123Z))
+	writeHeader(&b, "Message-ID", MessageID(from, ""))
 	writeHeader(&b, "MIME-Version", "1.0")
 	writeHeader(&b, "Content-Type", "text/plain; charset=utf-8")
 	b.WriteString("\r\n")

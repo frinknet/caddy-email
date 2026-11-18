@@ -409,6 +409,7 @@ func (m *MTA) janitor() {
 // Enqueue implements shared.Enqueuer; delegates to the package function after
 // enforcing the spool quota.
 func (m *MTA) Enqueue(_ context.Context, env *shared.Envelope, raw []byte) (string, error) {
+	raw = shared.EnsureMessageID(raw, env.From, m.Hostname)
 	if err := m.checkQuota(int64(len(raw))); err != nil {
 		return "", err
 	}

@@ -90,17 +90,19 @@ host_port() {
 
 ROUTE_PORT=$(host_port 2525)
 HTTP_PORT=$(host_port 8081)
-export ROUTE_PORT HTTP_PORT
+export ROUTE_PORT HTTP_PORT NAME
 
 python3 - <<'PY'
 import http.client
 import os
 import socket
+import subprocess
 import sys
 import time
 
 route_port = int(os.environ["ROUTE_PORT"])
 http_port = int(os.environ["HTTP_PORT"])
+container = os.environ["NAME"]
 
 
 def wait_for_banner(port):
@@ -150,6 +152,28 @@ def request(method, path, body=None, headers=None):
         conn.close()
 
 
+def spooled():
+    """Return the raw text of every queued message body."""
+    out = subprocess.run(
+        ["docker", "exec", container, "sh", "-c", "cat /var/lib/caddy/spool/incoming/df*"],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        sys.exit("could not read the spool: " + out.stderr)
+    return out.stdout
+
+
+def message_id_lines(raw):
+    ids = []
+    for line in raw.splitlines():
+        if line.lower().startswith("message-id:"):
+            ids.append(line)
+        elif line == "":
+            break
+    return ids
+
+
 wait_for_banner(route_port)
 
 clean = (
@@ -188,6 +212,33 @@ status, body = request(
 if status != 202:
     sys.exit("POST /sendmail/ returned %d, want 202: %s" % (status, body))
 
+# The message crossed the spool without a Message-ID, so one must be generated
+# from the envelope sender's domain.
+ids = message_id_lines(spooled())
+if len(ids) != 1:
+    sys.exit("spooled message has %d Message-ID headers, want 1: %r" % (len(ids), ids))
+if not ids[0].startswith("Message-ID: <") or "@example.com>" not in ids[0]:
+    sys.exit("generated Message-ID has the wrong shape: %r" % ids[0])
+
+# A caller-supplied Message-ID must be preserved, not replaced or duplicated.
+status, body = request(
+    "POST",
+    "/sendmail/",
+    body="keep my id",
+    headers={
+        "From": "sender@example.com",
+        "To": "rcpt@example.com",
+        "Message-ID": "<keep@example.com>",
+    },
+)
+if status != 202:
+    sys.exit("POST /sendmail/ with Message-ID returned %d, want 202: %s" % (status, body))
+raw = spooled()
+if "<keep@example.com>" not in raw:
+    sys.exit("caller-supplied Message-ID was replaced: %r" % raw)
+if raw.lower().count("message-id:") != 2:
+    sys.exit("want exactly one Message-ID per message, spool holds: %r" % raw)
+
 # Leg 3: scrape Caddy's metrics handler.
 status, metrics = request("GET", "/metrics")
 if status != 200:
@@ -215,8 +266,8 @@ def metric_value(text, name):
 
 
 exact = {
-    "caddy_email_sendmail_enqueued_total": 1.0,
-    "caddy_email_mta_enqueued_total": 1.0,
+    "caddy_email_sendmail_enqueued_total": 2.0,
+    "caddy_email_mta_enqueued_total": 2.0,
 }
 for name, want in exact.items():
     got = metric_value(metrics, name)
@@ -233,11 +284,11 @@ for name, want in {
     if got < want:
         sys.exit("%s = %v, want at least %v" % (name, got, want))
 
-# The spool gauges are computed at scrape time: the one enqueued job sits in
-# incoming/ (settle_delay keeps the tick from claiming it).
+# The spool gauges are computed at scrape time: the two enqueued jobs sit in
+# incoming/ (settle_delay keeps the tick from claiming them).
 incoming = metric_value(metrics, 'caddy_email_mta_spool_jobs{state="incoming"}')
-if incoming != 1.0:
-    sys.exit('caddy_email_mta_spool_jobs{state="incoming"} = %v, want 1' % incoming)
+if incoming != 2.0:
+    sys.exit('caddy_email_mta_spool_jobs{state="incoming"} = %v, want 2' % incoming)
 if metric_value(metrics, "caddy_email_mta_spool_bytes") <= 0:
     sys.exit("caddy_email_mta_spool_bytes = 0, want > 0")
 
