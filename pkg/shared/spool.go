@@ -236,9 +236,16 @@ func parseQF(data []byte) (*Job, error) {
 			}
 			j.Enqueued = time.Unix(t, 0)
 		case 'N':
-			j.Attempts, _ = strconv.Atoi(line[1:])
+			n, err := strconv.Atoi(line[1:])
+			if err != nil {
+				return nil, fmt.Errorf("N: %w", err)
+			}
+			j.Attempts = n
 		case 'P':
-			p, _ := strconv.ParseInt(line[1:], 10, 64)
+			p, err := strconv.ParseInt(line[1:], 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("P: %w", err)
+			}
 			if p > 0 {
 				j.NextAt = time.Unix(p, 0)
 			}
@@ -550,8 +557,18 @@ func SpoolSize(spoolDir string) (int64, error) {
 // cutoff, bounding the size of the failed-message archive. Returns the number
 // of files removed.
 func PruneBounce(spoolDir string, cutoff time.Time) int {
-	bnc := filepath.Join(spoolDir, StateBounce)
-	entries, err := os.ReadDir(bnc)
+	return pruneState(spoolDir, StateBounce, cutoff)
+}
+
+// PruneCorrupt deletes files in corrupt/ whose modification time is older than
+// cutoff, so quarantined messages cannot grow without bound.
+func PruneCorrupt(spoolDir string, cutoff time.Time) int {
+	return pruneState(spoolDir, StateCorrupt, cutoff)
+}
+
+func pruneState(spoolDir, state string, cutoff time.Time) int {
+	dir := filepath.Join(spoolDir, state)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0
 	}
@@ -564,7 +581,7 @@ func PruneBounce(spoolDir string, cutoff time.Time) int {
 		if err != nil || info.ModTime().After(cutoff) {
 			continue
 		}
-		if err := os.Remove(filepath.Join(bnc, e.Name())); err == nil {
+		if err := os.Remove(filepath.Join(dir, e.Name())); err == nil {
 			n++
 		}
 	}

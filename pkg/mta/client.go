@@ -1,6 +1,7 @@
 package mta
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
@@ -84,13 +85,15 @@ func (m *MTA) deliverOne(hosts []string, j *shared.Job) {
 	// connect (or fails the greeting / TLS requirement) is the job deferred;
 	// once connected, failures are per-message and retried on the next pass.
 	var (
-		c       *smtp.Client
-		conn    net.Conn
-		lastErr error
+		c        *smtp.Client
+		conn     net.Conn
+		lastErr  error
+		usedHost string
 	)
 	for _, host := range hosts {
 		c, conn, lastErr = m.connectHost(host)
 		if lastErr == nil {
+			usedHost = host
 			break
 		}
 		m.logger().Warn("mta: mx attempt failed",
@@ -105,6 +108,14 @@ func (m *MTA) deliverOne(hosts []string, j *shared.Job) {
 	}
 	defer conn.Close()
 	defer c.Close()
+
+	// Record this hop before handing the message to the remote MX. The trace
+	// header stays outside the DKIM signature, as it does at every relay.
+	forAddr := ""
+	if len(j.To) == 1 {
+		forAddr = j.To[0]
+	}
+	body = shared.PrependHeader(body, shared.ReceivedHeader(m.Hostname, "", usedHost, "ESMTP", j.ID, forAddr, time.Now()))
 
 	good, bad, err := m.deliverSession(conn, c, j, body)
 	if err != nil {
@@ -217,7 +228,7 @@ func (m *MTA) reEnqueue(j *shared.Job, body []byte, rcpts []string) {
 		To:   rcpts,
 		Meta: j.Meta,
 	}
-	newID, err := shared.Enqueue(m.SpoolDir, env, body)
+	newID, err := m.Enqueue(context.Background(), env, body)
 	if err != nil {
 		m.logger().Error("mta: re-enqueue failed recipients",
 			zap.String("orig_id", j.ID),
@@ -308,7 +319,7 @@ func (m *MTA) failRecipients(j *shared.Job, rcpts []string, msg string) {
 		To:   []string{j.From},
 		Meta: map[string]string{metaDSN: "1"},
 	}
-	if _, err := shared.Enqueue(m.SpoolDir, env, dsn); err != nil {
+	if _, err := m.Enqueue(context.Background(), env, dsn); err != nil {
 		m.logger().Error("mta: queue bounce DSN",
 			zap.String("id", j.ID),
 			zap.String("rcpt", j.From),

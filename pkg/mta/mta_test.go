@@ -172,6 +172,25 @@ func TestMTAValidateNumeric(t *testing.T) {
 	if err := (&MTA{MaxRetries: -1}).Validate(); err == nil {
 		t.Error("expected error for negative max_retries")
 	}
+	for name, m := range map[string]*MTA{
+		"tick_interval":    {TickInterval: caddy.Duration(-time.Second)},
+		"connect_timeout":  {ConnectTimeout: caddy.Duration(-time.Second)},
+		"data_timeout":     {DataTimeout: caddy.Duration(-time.Second)},
+		"command_timeout":  {CommandTimeout: caddy.Duration(-time.Second)},
+		"bounce_retention": {BounceRetention: caddy.Duration(-time.Second)},
+		"initial_backoff":  {InitialBackoff: caddy.Duration(-time.Second)},
+		"max_backoff":      {MaxBackoff: caddy.Duration(-time.Second)},
+	} {
+		if err := m.Validate(); err == nil {
+			t.Errorf("expected error for negative %s", name)
+		}
+	}
+	if err := (&MTA{
+		InitialBackoff: caddy.Duration(time.Hour),
+		MaxBackoff:     caddy.Duration(time.Minute),
+	}).Validate(); err == nil {
+		t.Error("expected error when initial_backoff exceeds max_backoff")
+	}
 
 	m := &MTA{}
 	m.applyDefaults()
@@ -556,6 +575,12 @@ func TestDeliverOneFailover(t *testing.T) {
 	if body := f.delivered(); !strings.Contains(string(body), "hello world") {
 		t.Errorf("body not delivered over failover: %q", body)
 	}
+	got := string(f.delivered())
+	for _, want := range []string{"Received: from mail.test", "by 127.0.0.1", "id " + id} {
+		if !strings.Contains(got, want) {
+			t.Errorf("delivered message missing %q:\n%s", want, got)
+		}
+	}
 }
 
 func TestDeliverOneRequireTLSDefers(t *testing.T) {
@@ -598,5 +623,56 @@ func TestCheckQuota(t *testing.T) {
 	m.MaxSpoolBytes = 0
 	if err := m.checkQuota(1 << 40); err != nil {
 		t.Errorf("unlimited quota rejected a message: %v", err)
+	}
+}
+
+func TestBounceRespectsQuota(t *testing.T) {
+	dir := newSpool(t)
+	m := &MTA{
+		SpoolDir:      dir,
+		Hostname:      "mail.test",
+		MaxSpoolBytes: 1,
+		log:           zap.NewNop(),
+	}
+	m.spoolBytes.Store(1)
+	j := &shared.Job{ID: "orig", From: "a@b.com", To: []string{"c@d.com"}}
+	m.failRecipients(j, j.To, "boom")
+	if n := countPrefix(t, filepath.Join(dir, shared.StateIncoming), "qf"); n != 0 {
+		t.Errorf("bounce bypassed the spool quota: %d queued", n)
+	}
+}
+
+func TestPruneMaps(t *testing.T) {
+	now := time.Now()
+	m := &MTA{
+		mxCache: map[string]mxCacheEntry{
+			"expired": {expiry: now.Add(-time.Minute)},
+			"live":    {expiry: now.Add(time.Hour)},
+		},
+		mxSem: map[string]mxSemEntry{
+			"idle":  {sem: make(chan struct{}, 1), lastUsed: now.Add(-2 * mxSemIdleTTL)},
+			"fresh": {sem: make(chan struct{}, 1), lastUsed: now},
+		},
+	}
+	m.pruneMaps(now)
+	if _, ok := m.mxCache["expired"]; ok {
+		t.Error("expired MX cache entry was not evicted")
+	}
+	if _, ok := m.mxCache["live"]; !ok {
+		t.Error("live MX cache entry was evicted")
+	}
+	if _, ok := m.mxSem["idle"]; ok {
+		t.Error("idle MX semaphore was not evicted")
+	}
+	if _, ok := m.mxSem["fresh"]; !ok {
+		t.Error("fresh MX semaphore was evicted")
+	}
+
+	held := make(chan struct{}, 1)
+	held <- struct{}{}
+	m.mxSem["held"] = mxSemEntry{sem: held, lastUsed: now.Add(-2 * mxSemIdleTTL)}
+	m.pruneMaps(now)
+	if _, ok := m.mxSem["held"]; !ok {
+		t.Error("in-use MX semaphore was evicted")
 	}
 }

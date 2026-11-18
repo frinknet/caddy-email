@@ -492,6 +492,25 @@ func TestSendmailAllowedFrom(t *testing.T) {
 	}
 }
 
+func TestSendmailAllowedFromWildcardAndCase(t *testing.T) {
+	s := &Sendmail{AllowedFrom: []string{"*example.com", "@Corp.Example", "Ops@Example.com"}}
+	for addr, want := range map[string]bool{
+		"user@example.com":        true,
+		"user@sub.example.com":    true,
+		"attacker@notexample.com": false,
+		"user@other.com":          false,
+		"User@EXAMPLE.COM":        true,
+		"x@corp.example":          true,
+		"x@sub.corp.example":      false,
+		"ops@example.com":         true,
+		"OPS@example.com":         true,
+	} {
+		if got := s.isAllowedSender(addr); got != want {
+			t.Errorf("isAllowedSender(%q) = %v, want %v", addr, got, want)
+		}
+	}
+}
+
 func TestSendmailAllowedFromHTTP(t *testing.T) {
 	s := &Sendmail{
 		AllowedFrom: []string{"@example.com"},

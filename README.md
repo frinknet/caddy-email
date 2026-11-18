@@ -185,8 +185,9 @@ docker run -d -p 80:80 -p 25:25 \
 
 See the `Dockerfile` for the scratch image — ~5 MB binary, nothing but caddy,
 toybox, and a prayer. The image loads `/srv/www/Caddyfile`, which is the
-default config shipped in `www/`. To check a built image end to end, deliver a
-message into its SMTP route with `tests/e2e/container.sh <image>`.
+default config shipped in `www/`. To check a built image end to end, run
+`tests/e2e/container.sh <image>`; it boots the image and exercises the SMTP
+route header allowlist, the sendmail handler, and the metrics endpoint.
 
 ---
 
@@ -261,7 +262,10 @@ sendmail {
 |---|---|
 | `user@example.com` | That exact sender |
 | `example.com` or `@example.com` | Any sender in that domain |
-| `*example.com` | Any sender ending in `example.com`, with no domain-boundary check |
+| `*example.com` | Any sender in that domain or a subdomain |
+
+Matching is case-insensitive, and domain patterns match whole domains:
+`*example.com` does not admit `attacker@notexample.com`.
 
 ### Template function
 
@@ -417,7 +421,7 @@ mta {
     require_tls         false        # defer unless the MX offers STARTTLS
     relay               kumo.internal:2525  # forward everything to a smarthost
     max_spool_bytes     0            # 0 = unlimited; reject new mail above this
-    bounce_retention    168h         # prune bounce/ archives older than this
+    bounce_retention    168h         # prune bounce/ and corrupt/ archives older than this
     shutdown_timeout    30s          # cap on waiting for in-flight deliveries
     notify_url          https://hooks.example.com/events
     notify_secret       hush-hush    # HMAC signs webhook payloads
@@ -434,7 +438,7 @@ mta {
 | `require_tls` | `false` | Refuse (defer) a host that does not offer STARTTLS |
 | `relay` | none | Forward all mail to this `host[:port]` instead of resolving MX |
 | `max_spool_bytes` | `0` (unlimited) | Reject new mail once the spool exceeds this many bytes |
-| `bounce_retention` | `168h` | Delete `bounce/` archive files older than this |
+| `bounce_retention` | `168h` | Delete `bounce/` and `corrupt/` archive files older than this |
 | `shutdown_timeout` | `30s` | Max time `Stop` waits for in-flight deliveries |
 
 The spool is single-writer: `Start` takes an exclusive lock on `spool_dir` and
@@ -665,5 +669,5 @@ spool costs one directory walk. The counters are exact.
 | Metrics endpoint | ✅ | Exposed on Caddy's `/metrics`; see Metrics |
 | File attachments in sendmail | ⏳ | Pre-build MIME, POST as `message/rfc822` |
 | Queue inspection API | ⏳ | Read files in `spool_dir` |
-| No received-header tracing | ⏳ | The MTA does not prepend `Received:` |
+| `Received:` tracing | ✅ | SMTP intake and outbound delivery each prepend a trace header |
 | IMAP/POP3 | ❌ | This is an MTA, not a boyfriend |

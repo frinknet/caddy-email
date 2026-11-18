@@ -168,18 +168,49 @@ func (m *MTA) splitMultiDomain(jobs []*shared.Job) []*shared.Job {
 	return out
 }
 
+// mxSemIdleTTL is how long an idle per-MX semaphore is kept before the janitor
+// evicts it, bounding the map for a server that talks to many MX hosts.
+const mxSemIdleTTL = time.Hour
+
+type mxSemEntry struct {
+	sem      chan struct{}
+	lastUsed time.Time
+}
+
 func (m *MTA) withMXSem(mx string, fn func()) {
 	m.mxSemMu.Lock()
 	if m.mxSem == nil {
-		m.mxSem = make(map[string]chan struct{})
+		m.mxSem = make(map[string]mxSemEntry)
 	}
-	sem, ok := m.mxSem[mx]
+	e, ok := m.mxSem[mx]
 	if !ok {
-		sem = make(chan struct{}, m.PerMXConcurrency)
-		m.mxSem[mx] = sem
+		e = mxSemEntry{sem: make(chan struct{}, m.PerMXConcurrency)}
 	}
+	e.lastUsed = time.Now()
+	m.mxSem[mx] = e
 	m.mxSemMu.Unlock()
+	sem := e.sem
 	sem <- struct{}{}
 	defer func() { <-sem }()
 	fn()
+}
+
+// pruneMXSem drops idle semaphores and expires the MX cache, so neither map
+// grows without bound on a long-running server.
+func (m *MTA) pruneMaps(now time.Time) {
+	m.mxSemMu.Lock()
+	for k, e := range m.mxSem {
+		if len(e.sem) == 0 && now.Sub(e.lastUsed) > mxSemIdleTTL {
+			delete(m.mxSem, k)
+		}
+	}
+	m.mxSemMu.Unlock()
+
+	m.mxCacheMu.Lock()
+	for k, e := range m.mxCache {
+		if !now.Before(e.expiry) {
+			delete(m.mxCache, k)
+		}
+	}
+	m.mxCacheMu.Unlock()
 }

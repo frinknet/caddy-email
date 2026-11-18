@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+
+	"github.com/frinknet/caddy-email/pkg/shared"
 )
 
 // dispatch synthesizes an *http.Request for the message, runs it through
@@ -23,7 +26,7 @@ func (s *session) dispatch(raw []byte) {
 	}
 
 	rrw := newSmtpResponseWriter()
-	req := s.buildRequest(raw)
+	req := s.buildRequest(s.withReceived(raw))
 
 	// Handlers expect the context Caddy normally attaches to a request:
 	// replacer, vars (client IP, trusted proxy), and a server. Without these
@@ -54,6 +57,25 @@ func (s *session) dispatch(raw []byte) {
 		metricMessages.Inc()
 	}
 	s.reply(code, msg)
+}
+
+// withReceived prepends this server's RFC 5321 trace header to the message so
+// the route, and anything downstream, can see the SMTP hop it arrived on.
+func (s *session) withReceived(raw []byte) []byte {
+	remote := s.conn.RemoteAddr().String()
+	if host, _, err := net.SplitHostPort(remote); err == nil {
+		remote = host
+	}
+	proto := "ESMTP"
+	if s.tlsOn {
+		proto = "ESMTPS"
+	}
+	forAddr := ""
+	if len(s.rcpts) == 1 {
+		forAddr = s.rcpts[0]
+	}
+	return shared.PrependHeader(raw,
+		shared.ReceivedHeader(s.helo, remote, s.lc.Hostname, proto, "", forAddr, time.Now()))
 }
 
 // forwardedHeaders is the allowlist of message header names copied into the

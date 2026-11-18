@@ -68,7 +68,7 @@ type MTA struct {
 	wg           sync.WaitGroup
 	notifyClient *http.Client
 	notifyCh     chan shared.DeliveryEvent
-	mxSem        map[string]chan struct{}
+	mxSem        map[string]mxSemEntry
 	mxSemMu      sync.Mutex
 	globalSem    chan struct{}
 	mxCache      map[string]mxCacheEntry
@@ -109,7 +109,7 @@ func (m *MTA) Provision(ctx caddy.Context) error {
 	if m.NotifyURL != "" {
 		m.notifyClient = &http.Client{Timeout: 10 * time.Second}
 	}
-	m.mxSem = make(map[string]chan struct{})
+	m.mxSem = make(map[string]mxSemEntry)
 	m.mxCache = make(map[string]mxCacheEntry)
 
 	if m.DKIM != nil && m.DKIM.PrivateKey != "" {
@@ -219,6 +219,27 @@ func (m *MTA) Validate() error {
 	if m.MaxSpoolBytes < 0 {
 		return fmt.Errorf("mta: max_spool_bytes must be >= 0")
 	}
+	for _, d := range []struct {
+		name string
+		val  caddy.Duration
+	}{
+		{"tick_interval", m.TickInterval},
+		{"connect_timeout", m.ConnectTimeout},
+		{"data_timeout", m.DataTimeout},
+		{"command_timeout", m.CommandTimeout},
+		{"mx_cache_ttl", m.MxCacheTTL},
+		{"shutdown_timeout", m.ShutdownTimeout},
+		{"initial_backoff", m.InitialBackoff},
+		{"max_backoff", m.MaxBackoff},
+		{"bounce_retention", m.BounceRetention},
+	} {
+		if d.val < 0 {
+			return fmt.Errorf("mta: %s must be >= 0", d.name)
+		}
+	}
+	if m.InitialBackoff > 0 && m.MaxBackoff > 0 && m.InitialBackoff > m.MaxBackoff {
+		return fmt.Errorf("mta: initial_backoff must not exceed max_backoff")
+	}
 	if m.Relay != "" {
 		if host, _, _ := m.relaySpec(); host == "" {
 			return fmt.Errorf("mta: invalid relay %q", m.Relay)
@@ -257,7 +278,7 @@ func (m *MTA) Start() error {
 		m.mxCache = make(map[string]mxCacheEntry)
 	}
 	if m.mxSem == nil {
-		m.mxSem = make(map[string]chan struct{})
+		m.mxSem = make(map[string]mxSemEntry)
 	}
 	if m.notifyCh == nil {
 		m.notifyCh = make(chan shared.DeliveryEvent, notifyBuffer)
@@ -372,10 +393,15 @@ func (m *MTA) janitor() {
 				m.logger().Info("mta: recovered stale active messages", zap.Int("count", n))
 			}
 			if r := time.Duration(m.BounceRetention); r > 0 {
-				if n := shared.PruneBounce(m.SpoolDir, time.Now().Add(-r)); n > 0 {
+				cutoff := time.Now().Add(-r)
+				if n := shared.PruneBounce(m.SpoolDir, cutoff); n > 0 {
 					m.logger().Info("mta: pruned bounce archive", zap.Int("files", n))
 				}
+				if n := shared.PruneCorrupt(m.SpoolDir, cutoff); n > 0 {
+					m.logger().Info("mta: pruned corrupt archive", zap.Int("files", n))
+				}
 			}
+			m.pruneMaps(time.Now())
 		}
 	}
 }

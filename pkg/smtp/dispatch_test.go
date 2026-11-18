@@ -97,3 +97,32 @@ func TestBuildRequestHeaderAllowlist(t *testing.T) {
 		t.Errorf("Host = %q, want configured hostname", req.Host)
 	}
 }
+
+func TestWithReceived(t *testing.T) {
+	t.Parallel()
+	s := newSession(&ListenerConfig{Hostname: "mx.test"}, newFakeConn())
+	s.helo = "client.example"
+	s.rcpts = []string{"u@example.com"}
+
+	raw := []byte("From: a@b\r\n\r\nbody")
+	got := string(s.withReceived(raw))
+	for _, want := range []string{
+		"Received: from client.example",
+		"(127.0.0.1)",
+		"by mx.test",
+		"with ESMTP",
+		"for <u@example.com>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("withReceived missing %q:\n%s", want, got)
+		}
+	}
+	if !strings.HasSuffix(got, "\r\nFrom: a@b\r\n\r\nbody") {
+		t.Errorf("withReceived did not prepend the header:\n%s", got)
+	}
+
+	s.tlsOn = true
+	if !strings.Contains(string(s.withReceived(raw)), "with ESMTPS") {
+		t.Error("withReceived did not mark the TLS variant")
+	}
+}

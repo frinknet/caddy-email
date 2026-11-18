@@ -473,3 +473,36 @@ func TestSpoolSizeAndPruneBounce(t *testing.T) {
 		t.Errorf("expected empty bounce dir, got %d entries", len(entries))
 	}
 }
+
+func TestParseQFRejectsMalformedCounters(t *testing.T) {
+	t.Parallel()
+	for _, bad := range []string{"Nabc", "Pxyz"} {
+		data := []byte("V8\nT1700000000\n" + bad + "\nS a@b.com\nR c@d.com\n")
+		if _, err := parseQF(data); err == nil {
+			t.Errorf("parseQF accepted malformed counter %q", bad)
+		}
+	}
+}
+
+func TestPruneCorrupt(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cor := filepath.Join(dir, StateCorrupt)
+	if err := os.MkdirAll(cor, 0700); err != nil {
+		t.Fatalf("mkdir corrupt: %v", err)
+	}
+	p := filepath.Join(cor, "qfold")
+	if err := os.WriteFile(p, []byte("x"), 0600); err != nil {
+		t.Fatalf("write corrupt file: %v", err)
+	}
+	past := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(p, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if n := PruneCorrupt(dir, time.Now().Add(-24*time.Hour)); n != 1 {
+		t.Fatalf("PruneCorrupt removed %d files, want 1", n)
+	}
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("corrupt file still present: %v", err)
+	}
+}

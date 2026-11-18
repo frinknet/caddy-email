@@ -58,6 +58,57 @@ func writeHeader(b *bytes.Buffer, name, value string) {
 	b.WriteString("\r\n")
 }
 
+// ReceivedHeader formats an RFC 5321 section 4.4 trace header. from is the
+// sending host, remoteAddr its network address when known, by the receiving
+// host, proto the SMTP variant ("ESMTP", "ESMTPS"), id an optional queue id,
+// and forAddr an optional envelope recipient. The result has no trailing CRLF.
+func ReceivedHeader(from, remoteAddr, by, proto, id, forAddr string, t time.Time) string {
+	var b strings.Builder
+	b.WriteString("Received: from ")
+	b.WriteString(traceValue(from, "unknown"))
+	if remoteAddr != "" {
+		b.WriteString(" (")
+		b.WriteString(SanitizeHeaderValue(remoteAddr))
+		b.WriteString(")")
+	}
+	b.WriteString(" by ")
+	b.WriteString(traceValue(by, "localhost"))
+	b.WriteString(" with ")
+	b.WriteString(traceValue(proto, "SMTP"))
+	if id != "" {
+		b.WriteString(" id ")
+		b.WriteString(SanitizeHeaderValue(id))
+	}
+	if forAddr != "" {
+		b.WriteString(" for <")
+		b.WriteString(SanitizeHeaderValue(forAddr))
+		b.WriteString(">")
+	}
+	b.WriteString("; ")
+	b.WriteString(t.Format(time.RFC1123Z))
+	return b.String()
+}
+
+func traceValue(v, fallback string) string {
+	v = strings.TrimSpace(SanitizeHeaderValue(v))
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
+// PrependHeader inserts header (without its trailing CRLF) at the top of raw.
+func PrependHeader(raw []byte, header string) []byte {
+	if header == "" {
+		return raw
+	}
+	out := make([]byte, 0, len(header)+2+len(raw))
+	out = append(out, header...)
+	out = append(out, '\r', '\n')
+	out = append(out, raw...)
+	return out
+}
+
 // BuildSimple constructs a minimal RFC 5322 text/plain message.
 // TODO: multipart, attachments, HTML.
 func BuildSimple(from string, to []string, subject, body string) []byte {

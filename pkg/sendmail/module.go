@@ -121,23 +121,34 @@ func (s *Sendmail) isAllowedSender(sender string) bool {
 	if len(s.AllowedFrom) == 0 {
 		return true
 	}
-	for _, p := range s.AllowedFrom {
+	// Addresses are compared case-insensitively, and wildcard/domain patterns
+	// must match a whole domain so "*example.com" cannot admit
+	// "attacker@notexample.com".
+	sender = strings.ToLower(strings.TrimSpace(sender))
+	domain := ""
+	if at := strings.LastIndex(sender, "@"); at >= 0 {
+		domain = sender[at+1:]
+	}
+	for _, rawPat := range s.AllowedFrom {
+		p := strings.ToLower(strings.TrimSpace(rawPat))
 		if p == "" {
 			continue
 		}
-		if p[0] == '*' {
-			if strings.HasSuffix(sender, p[1:]) {
+		switch p[0] {
+		case '*':
+			d := strings.TrimPrefix(p[1:], ".")
+			if d == "" {
 				return true
 			}
-		} else if p[0] == '@' {
-			if strings.HasSuffix(sender, p) {
+			if domain == d || strings.HasSuffix(domain, "."+d) {
 				return true
 			}
-		} else {
-			if sender == p {
+		case '@':
+			if domain == p[1:] {
 				return true
 			}
-			if strings.HasSuffix(sender, "@"+p) {
+		default:
+			if sender == p || domain == p {
 				return true
 			}
 		}

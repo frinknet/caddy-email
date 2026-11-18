@@ -20,10 +20,11 @@ func init() {
 type SMTP struct {
 	Listeners []*ListenerConfig `json:"listeners,omitempty"`
 
-	log    *zap.Logger
-	lns    []net.Listener
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	log      *zap.Logger
+	lns      []net.Listener
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	wg       sync.WaitGroup
 }
 
 // ListenerConfig describes one receive-only SMTP listener.
@@ -125,11 +126,20 @@ func (s *SMTP) Validate() error {
 }
 
 func (s *SMTP) Start() error {
+	s.stopOnce = sync.Once{}
 	s.stopCh = make(chan struct{})
+	s.lns = nil
 	for _, lc := range s.Listeners {
 		addr := fmt.Sprintf(":%d", lc.Port)
 		ln, err := net.Listen("tcp", addr)
 		if err != nil {
+			// Release every listener already bound by this attempt so a
+			// partial failure does not leave ports held.
+			s.stopOnce.Do(func() { close(s.stopCh) })
+			for _, bound := range s.lns {
+				bound.Close()
+			}
+			s.wg.Wait()
 			return fmt.Errorf("smtp: listen %s: %w", addr, err)
 		}
 		s.lns = append(s.lns, ln)
@@ -141,7 +151,10 @@ func (s *SMTP) Start() error {
 }
 
 func (s *SMTP) Stop() error {
-	close(s.stopCh)
+	if s.stopCh == nil {
+		return nil
+	}
+	s.stopOnce.Do(func() { close(s.stopCh) })
 	for _, ln := range s.lns {
 		ln.Close()
 	}
