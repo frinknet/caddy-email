@@ -291,6 +291,10 @@ if incoming != 2.0:
     sys.exit('caddy_email_mta_spool_jobs{state="incoming"} = %v, want 2' % incoming)
 if metric_value(metrics, "caddy_email_mta_spool_bytes") <= 0:
     sys.exit("caddy_email_mta_spool_bytes = 0, want > 0")
+# Every exported state is a state something can write to. hold/ used to be
+# created and reported but never written, so it must not be exported.
+if 'caddy_email_mta_spool_jobs{state="hold"}' in metrics:
+    sys.exit("caddy_email_mta_spool_jobs exports a dead hold state")
 
 print("container e2e ok")
 PY

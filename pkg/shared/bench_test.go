@@ -13,7 +13,7 @@ func benchSpool(b *testing.B) string {
 	dir := b.TempDir()
 	for _, sub := range []string{
 		StateIncoming, StateActive, StateDeferred,
-		StateBounce, StateCorrupt, StateHold,
+		StateBounce, StateCorrupt,
 	} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0700); err != nil {
 			b.Fatalf("mkdir %s: %v", sub, err)

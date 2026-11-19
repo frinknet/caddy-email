@@ -32,7 +32,6 @@ const (
 	StateDeferred = "deferred"
 	StateBounce   = "bounce"
 	StateCorrupt  = "corrupt"
-	StateHold     = "hold"
 )
 
 // Envelope is the metadata for an outbound message.
@@ -474,7 +473,7 @@ func RecoverActive(spoolDir string, cutoff time.Duration, skip func(string) bool
 func ReconcileSpool(spoolDir string) int {
 	states := []string{
 		StateIncoming, StateActive, StateDeferred,
-		StateBounce, StateCorrupt, StateHold,
+		StateBounce, StateCorrupt,
 	}
 	qfAt := make(map[string]string)
 	dfAt := make(map[string]string)

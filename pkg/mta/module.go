@@ -100,7 +100,7 @@ func (m *MTA) Provision(ctx caddy.Context) error {
 	if err := os.MkdirAll(m.SpoolDir, 0700); err != nil {
 		return fmt.Errorf("mta: spool_dir %s: %w", m.SpoolDir, err)
 	}
-	for _, sub := range []string{shared.StateIncoming, shared.StateActive, shared.StateDeferred, shared.StateBounce, shared.StateCorrupt, shared.StateHold} {
+	for _, sub := range []string{shared.StateIncoming, shared.StateActive, shared.StateDeferred, shared.StateBounce, shared.StateCorrupt} {
 		if err := os.MkdirAll(filepath.Join(m.SpoolDir, sub), 0700); err != nil {
 			return err
 		}

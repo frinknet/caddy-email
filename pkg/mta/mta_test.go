@@ -23,7 +23,7 @@ func newSpool(t *testing.T) string {
 	dir := t.TempDir()
 	for _, sub := range []string{
 		shared.StateIncoming, shared.StateActive, shared.StateDeferred,
-		shared.StateBounce, shared.StateCorrupt, shared.StateHold,
+		shared.StateBounce, shared.StateCorrupt,
 	} {
 		if err := os.MkdirAll(filepath.Join(dir, sub), 0700); err != nil {
 			t.Fatalf("mkdir %s: %v", sub, err)

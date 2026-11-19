@@ -625,7 +625,7 @@ If you run `admin off`, mount Caddy's `metrics` handler on a route instead:
 | `caddy_email_mta_enqueued_total` | counter | | Messages accepted into the spool |
 | `caddy_email_mta_notify_dropped_total` | counter | | Webhook events dropped because the buffer was full |
 | `caddy_email_mta_spool_bytes` | gauge | | Bytes held by the spool directory |
-| `caddy_email_mta_spool_jobs` | gauge | `state` (`incoming`, `active`, `deferred`, `bounce`, `corrupt`, `hold`) | Queued jobs by spool state |
+| `caddy_email_mta_spool_jobs` | gauge | `state` (`incoming`, `active`, `deferred`, `bounce`, `corrupt`) | Queued jobs by spool state |
 | `caddy_email_smtp_connections_total` | counter | | Inbound SMTP connections accepted |
 | `caddy_email_smtp_messages_total` | counter | | Inbound messages accepted by the route |
 | `caddy_email_sendmail_enqueued_total` | counter | | Messages accepted by the sendmail HTTP API |

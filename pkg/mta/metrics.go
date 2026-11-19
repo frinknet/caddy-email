@@ -45,7 +45,7 @@ var (
 
 var spoolStates = []string{
 	shared.StateIncoming, shared.StateActive, shared.StateDeferred,
-	shared.StateBounce, shared.StateCorrupt, shared.StateHold,
+	shared.StateBounce, shared.StateCorrupt,
 }
 
 // spoolCollector reports queue depth and disk usage for one spool directory.

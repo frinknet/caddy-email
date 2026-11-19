@@ -79,7 +79,6 @@ The spool is a directory with one subdirectory per state:
 | `deferred/` | Temporary failure, waiting for `next_at` |
 | `bounce/` | Permanently failed, retained for `bounce_retention` |
 | `corrupt/` | Unparseable `qf`, quarantined |
-| `hold/` | Reserved; nothing writes to it yet |
 
 Each job is a pair of files named by a shared id:
 
@@ -530,7 +529,7 @@ Deliberately unimplemented. Defects and hardening work live in `BACKLOG.md`.
 * **DKIM canonicalization choices.** Only `simple/simple`; no `relaxed`.
 * **Attachments in sendmail.** Pre-build MIME and POST as `message/rfc822`.
 * **Queue inspection API.** Read the files in `spool_dir`.
-* **`hold/` state.** The directory exists and is reported, but nothing moves a
-  job into it; there is no admin hold/resume.
+* **Admin hold/resume.** No way to park a job: there is no `hold/` state
+  and no admin API.
 * **`Received:` tracing.** The MTA does not prepend a `Received` header.
 * **IMAP / POP3.** This is an MTA.
