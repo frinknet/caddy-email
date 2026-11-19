@@ -83,6 +83,15 @@ func parseSMTPOption(d *caddyfile.Dispenser, existing any) (any, error) {
 					return nil, err
 				}
 				lc.MaxIPClients = n
+			case "max_ip_rate":
+				if !d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				n, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return nil, err
+				}
+				lc.MaxIPRate = n
 			case "deliver_timeout":
 				if !d.NextArg() {
 					return nil, d.ArgErr()

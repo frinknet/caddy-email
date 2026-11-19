@@ -301,6 +301,7 @@ sendmail {
         max_recipients      50
         max_connections     200
         max_ip_clients      50
+        max_ip_rate         10
         deliver_timeout     30s
         route {
             reverse_proxy localhost:8080
@@ -319,6 +320,7 @@ sendmail {
 | `max_recipients` | 50 | The 51st `RCPT TO` is rejected with `452` |
 | `max_connections` | 200 | Concurrent connections; further clients wait |
 | `max_ip_clients` | 50 | Concurrent connections from one remote IP; further ones get `421` |
+| `max_ip_rate` | off | New connections per second from one remote IP; further ones get `421` |
 | `deliver_timeout` | 30s | Read and write deadline, and the idle-session cap |
 | `route` | none | Caddy route the parsed message is handed to |
 
@@ -337,6 +339,15 @@ closed immediately, and each refusal is counted by
 `caddy_email_smtp_ip_rejections_total`. It counts concurrency, not rate, so a
 peer that connects and disconnects quickly is still bounded by how fast slots
 free up. Raise it for a bulk sender that legitimately opens many connections.
+
+`max_ip_rate` closes that gap: it caps how many new connections one remote IP
+may open per second, with the same number allowed as an instantaneous burst.
+The next connection past the allowance is refused with `421 4.7.1` and closed
+immediately, and each refusal is counted by
+`caddy_email_smtp_ip_rate_rejections_total`. The bucket refills continuously,
+so a client that sends a few messages over separate connections is unaffected
+while a reconnect loop is turned away. It is off unless configured; raise it
+for a peer that legitimately opens many short-lived connections.
 
 ### What the route handler sees
 
@@ -643,6 +654,7 @@ If you run `admin off`, mount Caddy's `metrics` handler on a route instead:
 | `caddy_email_mta_spool_jobs` | gauge | `state` (`incoming`, `active`, `deferred`, `bounce`, `corrupt`) | Queued jobs by spool state |
 | `caddy_email_smtp_connections_total` | counter | | Inbound SMTP connections accepted |
 | `caddy_email_smtp_ip_rejections_total` | counter | | Connections refused by the per-IP connection cap |
+| `caddy_email_smtp_ip_rate_rejections_total` | counter | | Connections refused by the per-IP connection rate cap |
 | `caddy_email_smtp_messages_total` | counter | | Inbound messages accepted by the route |
 | `caddy_email_sendmail_enqueued_total` | counter | | Messages accepted by the sendmail HTTP API |
 

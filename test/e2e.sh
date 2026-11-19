@@ -15,6 +15,7 @@ TMP=$(mktemp -d /tmp/caddy-email-e2e-XXXXXX)
 PORT=9099
 SMTP_PORT=9098
 PERIP_PORT=9097
+RATE_PORT=9096
 SLUG=$(sed -n '1s/^[^:]*: //p' ./NOTICE)
 IMAGE="${E2E_IMAGE:-${SLUG}:test}"
 CONTAINER_NAME="caddyemail-e2e-runner"
@@ -57,6 +58,13 @@ cat >"$TMP/Caddyfile" <<'CADDY'
 		hostname mail.test
 		tls off
 		max_ip_clients 1
+	}
+	# One new connection per second per peer, so a reconnect burst is refused
+	# rather than accepted. Test 10 opens two connections back to back.
+	smtp :2527 {
+		hostname mail.test
+		tls off
+		max_ip_rate 1
 	}
 }
 
@@ -120,6 +128,7 @@ timeout 60s docker run -d \
 	-p "127.0.0.1:$PORT:8081" \
 	-p "127.0.0.1:$SMTP_PORT:2525" \
 	-p "127.0.0.1:$PERIP_PORT:2526" \
+	-p "127.0.0.1:$RATE_PORT:2527" \
 	"$IMAGE" run --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
 
 echo "=== Waiting for Caddy ==="
@@ -461,6 +470,37 @@ METRICS_STATUS=$?
 set -e
 check_eq "GET /metrics succeeds after the per-IP probe" 0 "$METRICS_STATUS"
 check_eq "one per-IP rejection counted" 1 "$(metric_value caddy_email_smtp_ip_rejections_total)"
+
+# ── Test 10: per-IP connection rate cap ────────────────
+echo ""
+echo "=== Test 10: per-IP connection rate cap ==="
+# The :2527 listener allows one new connection per second per peer. Two
+# connections opened back to back must let the first through and refuse the
+# second with a retryable 421; once the bucket refills the peer may connect
+# again. A concurrency cap would let the second one through, so this fails
+# without rate limiting.
+set +e
+RATE_FIRST=$(curl -sS -v --max-time 10 --url "smtp://127.0.0.1:$RATE_PORT" \
+	--mail-from a@b --mail-rcpt c@d --upload-file "$TMP/control.eml" 2>&1)
+RATE_SECOND=$(curl -sS -v --max-time 10 --url "smtp://127.0.0.1:$RATE_PORT" \
+	--mail-from a@b --mail-rcpt c@d --upload-file "$TMP/control.eml" 2>&1)
+set -e
+check "first connection under the rate cap is greeted" '^< 220 ' "$RATE_FIRST"
+check "back-to-back connection is refused by the rate cap" '^< 421 4\.7\.1' "$RATE_SECOND"
+
+sleep 2
+set +e
+RATE_AFTER=$(curl -sS -v --max-time 10 --url "smtp://127.0.0.1:$RATE_PORT" \
+	--mail-from a@b --mail-rcpt c@d --upload-file "$TMP/control.eml" 2>&1)
+set -e
+check "peer is greeted again once the bucket refills" '^< 220 ' "$RATE_AFTER"
+
+set +e
+METRICS=$(curl -sf --max-time 10 "http://127.0.0.1:$PORT/metrics")
+METRICS_STATUS=$?
+set -e
+check_eq "GET /metrics succeeds after the rate probe" 0 "$METRICS_STATUS"
+check_eq "one per-IP rate rejection counted" 1 "$(metric_value caddy_email_smtp_ip_rate_rejections_total)"
 
 # ── Summary ────────────────────────────────────────────
 echo ""

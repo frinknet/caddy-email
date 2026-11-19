@@ -110,6 +110,46 @@ func TestCaddyfileMaxIPClientsParsed(t *testing.T) {
 	}
 }
 
+// TestCaddyfileMaxIPRateParsed guards the documented `max_ip_rate` option:
+// dropping it in the adapter would leave the listener without a connection
+// rate cap while the operator believes one is configured.
+func TestCaddyfileMaxIPRateParsed(t *testing.T) {
+	t.Parallel()
+	src := []byte(`{
+    smtp :2525 {
+        max_ip_rate 3
+    }
+}
+`)
+	adapter := caddyconfig.GetAdapter("caddyfile")
+	if adapter == nil {
+		t.Fatal("caddyfile adapter not registered")
+	}
+	adapted, _, err := adapter.Adapt(caddyfile.Format(src), nil)
+	if err != nil {
+		t.Fatalf("adapt: %v", err)
+	}
+
+	var cfg struct {
+		Apps struct {
+			SMTP struct {
+				Listeners []struct {
+					MaxIPRate int `json:"max_ip_rate"`
+				} `json:"listeners"`
+			} `json:"smtp"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(adapted, &cfg); err != nil {
+		t.Fatalf("decode adapted config: %v", err)
+	}
+	if n := len(cfg.Apps.SMTP.Listeners); n != 1 {
+		t.Fatalf("listeners = %d, want 1", n)
+	}
+	if got := cfg.Apps.SMTP.Listeners[0].MaxIPRate; got != 3 {
+		t.Fatalf("max_ip_rate = %d, want 3", got)
+	}
+}
+
 // TestCaddyfileRepeatedSMTPBlocksKeepBothListeners guards the README promise
 // that the block is repeatable: Caddy stores one value per global option, so
 // the adapter must merge listeners across occurrences instead of letting the

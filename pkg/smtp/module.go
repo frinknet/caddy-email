@@ -41,6 +41,7 @@ type ListenerConfig struct {
 	MaxRecipients  int                 `json:"max_recipients,omitempty"`
 	MaxConnections int                 `json:"max_connections,omitempty"`
 	MaxIPClients   int                 `json:"max_ip_clients,omitempty"`
+	MaxIPRate      int                 `json:"max_ip_rate,omitempty"`
 	DeliverTimeout caddy.Duration      `json:"deliver_timeout,omitempty"`
 	TLS            string              `json:"tls,omitempty"` // "starttls" | "off"
 	TLSCertFile    string              `json:"tls_cert_file,omitempty"`
@@ -116,6 +117,9 @@ func (s *SMTP) Validate() error {
 		if lc.MaxIPClients < 0 {
 			return fmt.Errorf("smtp :%d max_ip_clients must be >= 0", lc.Port)
 		}
+		if lc.MaxIPRate < 0 {
+			return fmt.Errorf("smtp :%d max_ip_rate must be >= 0", lc.Port)
+		}
 		if lc.MaxMessageSize < 0 {
 			return fmt.Errorf("smtp :%d max_message_size must be >= 0", lc.Port)
 		}
@@ -173,6 +177,7 @@ func (s *SMTP) serve(lc *ListenerConfig, ln net.Listener) {
 	defer s.wg.Done()
 	sem := make(chan struct{}, lc.MaxConnections)
 	perIP := newIPLimiter(lc.MaxIPClients)
+	rate := newIPRateLimiter(lc.MaxIPRate)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -184,6 +189,13 @@ func (s *SMTP) serve(lc *ListenerConfig, ln net.Listener) {
 			}
 		}
 		ip := remoteIP(conn.RemoteAddr())
+		if rate != nil && !rate.allow(ip) {
+			metricIPRateRejections.Inc()
+			s.log.Warn("smtp: per-IP connection rate limit reached",
+				zap.String("ip", ip), zap.Int("max_ip_rate", lc.MaxIPRate))
+			rejectTooFast(lc, conn)
+			continue
+		}
 		if perIP != nil && !perIP.acquire(ip) {
 			metricIPRejections.Inc()
 			s.log.Warn("smtp: per-IP connection limit reached",

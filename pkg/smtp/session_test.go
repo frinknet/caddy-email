@@ -47,6 +47,7 @@ func TestSMTPValidateNumeric(t *testing.T) {
 		"max_connections": {Port: 25, MaxConnections: -1},
 		"max_message":     {Port: 25, MaxMessageSize: -1},
 		"max_recipients":  {Port: 25, MaxRecipients: -1},
+		"max_ip_rate":     {Port: 25, MaxIPRate: -1},
 	} {
 		if err := (&SMTP{Listeners: []*ListenerConfig{lc}}).Validate(); err == nil {
 			t.Errorf("expected error for negative %s", name)

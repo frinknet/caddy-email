@@ -64,9 +64,15 @@ func remoteIP(addr net.Addr) string {
 // rejectTooManyConnections answers the peer with a retryable 421 and closes,
 // so it backs off instead of timing out against a stalled accept loop.
 func rejectTooManyConnections(lc *ListenerConfig, conn net.Conn) {
+	rejectWith(lc, conn, "421 4.7.0 Too many connections from your IP, try again later\r\n")
+}
+
+// rejectWith writes one reply under the listener's write deadline and closes
+// the connection, so a peer that stops reading cannot pin the goroutine.
+func rejectWith(lc *ListenerConfig, conn net.Conn, reply string) {
 	defer conn.Close()
 	if d := time.Duration(lc.DeliverTimeout); d > 0 {
 		conn.SetWriteDeadline(time.Now().Add(d))
 	}
-	fmt.Fprint(conn, "421 4.7.0 Too many connections from your IP, try again later\r\n")
+	fmt.Fprint(conn, reply)
 }

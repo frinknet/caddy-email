@@ -370,6 +370,7 @@ Global option `smtp`, repeatable per port: `smtp :25 { ... }` and
 | `max_recipients` | 50 | `452` on the 51st `RCPT TO` |
 | `max_connections` | 200 | Concurrent connections |
 | `max_ip_clients` | 50 | Concurrent connections per remote IP; further ones get `421` |
+| `max_ip_rate` | off | New connections per second per remote IP; further ones get `421` |
 | `deliver_timeout` | 30s | Read/write deadline and idle cap |
 | `route` | none | Caddy route the parsed message is handed to |
 
@@ -439,7 +440,15 @@ makes the remote MTA retry.
 `caddy_email_smtp_connections_total` (connections accepted) and
 `caddy_email_smtp_messages_total` (messages accepted by the route, i.e. replied
 `250`), plus `caddy_email_smtp_ip_rejections_total` (connections refused by the
-per-IP cap), registered the same way as the `mta` metrics.
+per-IP concurrency cap) and `caddy_email_smtp_ip_rate_rejections_total`
+(connections refused by the per-IP connection rate cap), registered the same way
+as the `mta` metrics.
+
+`max_ip_rate` uses a per-peer token bucket: the bucket holds the configured
+number of tokens and refills at one token per second times that number, so a
+short burst up to the limit is allowed and a reconnect loop is refused with
+`421 4.7.1`. Idle buckets are dropped after a second, the same time a full
+refill takes, so the map stays bounded by recently seen peers.
 
 ---
 

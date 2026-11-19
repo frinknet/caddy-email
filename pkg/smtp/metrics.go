@@ -33,6 +33,13 @@ var (
 		Name:      "ip_rejections_total",
 		Help:      "Inbound SMTP connections refused by the per-IP connection cap.",
 	})
+
+	metricIPRateRejections = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: metricsNamespace,
+		Subsystem: "smtp",
+		Name:      "ip_rate_rejections_total",
+		Help:      "Inbound SMTP connections refused by the per-IP connection rate cap.",
+	})
 )
 
 // registerMetrics registers the SMTP collectors with the given registry,
@@ -41,7 +48,7 @@ func registerMetrics(reg *prometheus.Registry) error {
 	if reg == nil {
 		return nil
 	}
-	for _, c := range []prometheus.Collector{metricConnections, metricMessages, metricIPRejections} {
+	for _, c := range []prometheus.Collector{metricConnections, metricMessages, metricIPRejections, metricIPRateRejections} {
 		if err := reg.Register(c); err != nil {
 			var already prometheus.AlreadyRegisteredError
 			if !errors.As(err, &already) {
