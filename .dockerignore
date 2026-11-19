@@ -1,7 +1,10 @@
 .*
 *.md
 !LICENSE
-tests/
+# tests/* rather than tests/ so the walker descends into the directory; the
+# stub image built by build.sh needs tests/e2e/stubcaddy and stubmta.
+tests/*
+!tests/e2e/
 data/
 build.sh
 *.log

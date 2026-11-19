@@ -184,10 +184,15 @@ docker run -d -p 80:80 -p 25:25 \
 ```
 
 See the `Dockerfile` for the scratch image — ~5 MB binary, nothing but caddy,
-toybox, and a prayer. The image loads `/srv/www/Caddyfile`, which is the
+toybox, and a prayer. The image loads `/etc/caddy/Caddyfile`, which is the
 default config shipped in `www/`. To check a built image end to end, run
-`tests/e2e/container.sh <image>`; it boots the image and exercises the SMTP
-route header allowlist, the sendmail handler, and the metrics endpoint.
+`E2E_IMAGE=<image> sh test/e2e.sh`; it boots the image and exercises the SMTP
+route header allowlist, the sendmail handler, the metrics endpoint, and startup
+validation. It also needs the stub image (`<image>-stub`, override with
+`CADDY_EMAIL_STUB_IMAGE`) that `./build.sh` produces from
+`tests/e2e/stub.Dockerfile`; the script runs it to prove startup fails with an
+error, not a panic, when the `mta` app is not the bundled enqueuer. Run the
+unit suite with `sh test/unit.sh`.
 
 ---
 

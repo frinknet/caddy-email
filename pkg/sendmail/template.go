@@ -36,7 +36,11 @@ func (s *SendmailTemplateFuncs) Provision(ctx caddy.Context) error {
 	if err != nil {
 		return fmt.Errorf("sendmail template functions require the mta app: %w", err)
 	}
-	s.enq = app.(shared.Enqueuer)
+	enq, err := enqueuerOf(app)
+	if err != nil {
+		return fmt.Errorf("sendmail template functions require the mta app: %w", err)
+	}
+	s.enq = enq
 	return nil
 }
 

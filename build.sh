@@ -93,4 +93,10 @@ if [ "$INIT" -eq 0 ]; then
   docker rmi "${REPOSLUG}" 2>/dev/null || true
   docker rmi "${SLUG}" 2>/dev/null || true
   docker build -t "${SLUG}:test" .
+
+  # The e2e suite also needs a binary whose "mta" app is a stub that is not a
+  # shared.Enqueuer, to prove sendmail fails startup cleanly instead of
+  # panicking. Both images are built here; the harness only runs them.
+  docker rmi "${SLUG}:test-stub" 2>/dev/null || true
+  docker build -t "${SLUG}:test-stub" -f tests/e2e/stub.Dockerfile .
 fi

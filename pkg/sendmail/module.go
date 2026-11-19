@@ -49,9 +49,9 @@ func (s *Sendmail) Provision(ctx caddy.Context) error {
 	if err != nil {
 		return fmt.Errorf("sendmail requires the mta app (add an `mta { ... }` global block): %w", err)
 	}
-	enq, ok := app.(shared.Enqueuer)
-	if !ok {
-		return fmt.Errorf("sendmail: mta app does not implement shared.Enqueuer")
+	enq, err := enqueuerOf(app)
+	if err != nil {
+		return err
 	}
 	s.enq = enq
 	if err := registerMetrics(ctx.GetMetricsRegistry()); err != nil {
@@ -59,6 +59,19 @@ func (s *Sendmail) Provision(ctx caddy.Context) error {
 		s.log.Warn("sendmail: metrics registration failed", zap.Error(err))
 	}
 	return nil
+}
+
+// errNotEnqueuer is returned when the configured mta app does not satisfy
+// shared.Enqueuer, instead of panicking on an unchecked type assertion.
+var errNotEnqueuer = errors.New("sendmail: mta app does not implement shared.Enqueuer")
+
+// enqueuerOf resolves the mta app into the Enqueuer contract sendmail needs.
+func enqueuerOf(app any) (shared.Enqueuer, error) {
+	enq, ok := app.(shared.Enqueuer)
+	if !ok {
+		return nil, errNotEnqueuer
+	}
+	return enq, nil
 }
 
 func (s *Sendmail) Validate() error { return nil }
