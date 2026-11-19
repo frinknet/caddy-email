@@ -170,8 +170,25 @@ func TestEnqueueScanClaimDeferBounceUnlink(t *testing.T) {
 	if err := Defer(dir, id, fixedTime.Add(60), 1, "try again"); err != nil {
 		t.Fatalf("Defer: %v", err)
 	}
-	Bounce(dir, id)
-	Unlink(dir, id) // no-op, should not panic
+
+	bid, err := Enqueue(dir, env, raw)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := Claim(dir, bid); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	if err := Bounce(dir, bid); err != nil {
+		t.Fatalf("Bounce: %v", err)
+	}
+	for _, name := range []string{"qf" + bid, "df" + bid} {
+		if _, err := os.Stat(filepath.Join(dir, StateBounce, name)); err != nil {
+			t.Fatalf("bounced %s missing: %v", name, err)
+		}
+	}
+	if err := Unlink(dir, bid); err != nil {
+		t.Fatalf("Unlink: %v", err)
+	}
 }
 
 func TestSweepDeferred(t *testing.T) {
@@ -453,7 +470,9 @@ func TestSpoolSizeAndPruneBounce(t *testing.T) {
 	if err := Claim(dir, id); err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	Bounce(dir, id)
+	if err := Bounce(dir, id); err != nil {
+		t.Fatalf("Bounce: %v", err)
+	}
 	// Backdate the archived files so they are eligible for pruning.
 	past := time.Now().Add(-48 * time.Hour)
 	for _, name := range []string{"qf" + id, "df" + id} {
@@ -504,5 +523,100 @@ func TestPruneCorrupt(t *testing.T) {
 	}
 	if _, err := os.Stat(p); !os.IsNotExist(err) {
 		t.Errorf("corrupt file still present: %v", err)
+	}
+}
+
+func TestUnlinkReportsFailureAndKeepsPair(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	id, err := Enqueue(dir, &Envelope{From: "a@b", To: []string{"c@d"}}, []byte("body"))
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := Claim(dir, id); err != nil {
+		t.Fatalf("Claim: %v", err)
+	}
+	act := filepath.Join(dir, StateActive)
+	qf := filepath.Join(act, "qf"+id)
+	if err := os.Remove(qf); err != nil {
+		t.Fatalf("remove qf: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(qf, "blocker"), 0700); err != nil {
+		t.Fatalf("mkdir blocker: %v", err)
+	}
+	if err := Unlink(dir, id); err == nil {
+		t.Fatal("expected Unlink to report the failed qf removal")
+	}
+	if _, err := os.Stat(filepath.Join(act, "df"+id)); err != nil {
+		t.Fatalf("df removed despite failed qf removal: %v", err)
+	}
+
+	if err := os.RemoveAll(qf); err != nil {
+		t.Fatalf("clear blocker: %v", err)
+	}
+	if err := Unlink(dir, id); err != nil {
+		t.Fatalf("Unlink retry: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(act, "df"+id)); !os.IsNotExist(err) {
+		t.Fatalf("df still present after unlink: %v", err)
+	}
+}
+
+func TestBounceReportsMkdirFailure(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	act := filepath.Join(dir, StateActive)
+	if err := os.MkdirAll(act, 0700); err != nil {
+		t.Fatalf("mkdir active: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(act, "dfjob"), []byte("body"), 0600); err != nil {
+		t.Fatalf("write df: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(act, "qfjob"), []byte("queue"), 0600); err != nil {
+		t.Fatalf("write qf: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, StateBounce), []byte("not a dir"), 0600); err != nil {
+		t.Fatalf("block bounce dir: %v", err)
+	}
+	if err := Bounce(dir, "job"); err == nil {
+		t.Fatal("expected Bounce to report the failed bounce dir creation")
+	}
+	for _, name := range []string{"dfjob", "qfjob"} {
+		if _, err := os.Stat(filepath.Join(act, name)); err != nil {
+			t.Fatalf("%s moved despite failed bounce: %v", name, err)
+		}
+	}
+}
+
+func TestBounceRollsBackBodyOnQFRenameFailure(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	act := filepath.Join(dir, StateActive)
+	bnc := filepath.Join(dir, StateBounce)
+	for _, d := range []string{act, bnc} {
+		if err := os.MkdirAll(d, 0700); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(act, "dfjob"), []byte("body"), 0600); err != nil {
+		t.Fatalf("write df: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(act, "qfjob"), []byte("queue"), 0600); err != nil {
+		t.Fatalf("write qf: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(bnc, "qfjob", "blocker"), 0700); err != nil {
+		t.Fatalf("mkdir blocker: %v", err)
+	}
+	if err := Bounce(dir, "job"); err == nil {
+		t.Fatal("expected Bounce to report the failed qf rename")
+	}
+	if _, err := os.Stat(filepath.Join(act, "dfjob")); err != nil {
+		t.Fatalf("df not rolled back to active: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(act, "qfjob")); err != nil {
+		t.Fatalf("qf lost from active: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(bnc, "dfjob")); !os.IsNotExist(err) {
+		t.Fatalf("df left in bounce: %v", err)
 	}
 }

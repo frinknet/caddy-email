@@ -125,7 +125,12 @@ func (m *MTA) deliverOne(hosts []string, j *shared.Job) {
 	c.Quit()
 
 	// Unlink the original job (all recipients handled or re-enqueued)
-	shared.Unlink(m.SpoolDir, j.ID)
+	if err := shared.Unlink(m.SpoolDir, j.ID); err != nil {
+		m.logger().Error("mta: unlink delivered job",
+			zap.String("id", j.ID),
+			zap.Error(err),
+		)
+	}
 
 	// Notify delivery for the successful recipients
 	m.notify(shared.DeliveryEvent{
@@ -294,7 +299,12 @@ func (m *MTA) failTemporary(j *shared.Job, msg string) {
 // failPermanent archives the message in bounce/ and, unless bouncing would
 // create a loop, queues an RFC 3464 DSN back to the envelope sender.
 func (m *MTA) failPermanent(j *shared.Job, msg string) {
-	shared.Bounce(m.SpoolDir, j.ID)
+	if err := shared.Bounce(m.SpoolDir, j.ID); err != nil {
+		m.logger().Error("mta: bounce",
+			zap.String("id", j.ID),
+			zap.Error(err),
+		)
+	}
 	m.failRecipients(j, j.To, msg)
 }
 

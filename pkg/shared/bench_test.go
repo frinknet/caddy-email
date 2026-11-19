@@ -101,7 +101,9 @@ func BenchmarkDispatchCycle(b *testing.B) {
 			if err := Claim(dir, j.ID); err != nil {
 				b.Fatal(err)
 			}
-			Unlink(dir, j.ID)
+			if err := Unlink(dir, j.ID); err != nil {
+				b.Fatal(err)
+			}
 		}
 	}
 }

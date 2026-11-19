@@ -374,11 +374,19 @@ func Claim(spoolDir, id string) error {
 	return nil
 }
 
-// Unlink removes both files after successful delivery.
-func Unlink(spoolDir, id string) {
+// Unlink removes both files after successful delivery. The qf goes first: it
+// is the commit marker, so a failure there leaves the pair intact for a retry
+// rather than stranding a body with no queue entry. A failed qf removal is
+// reported so the caller can log it; the job stays deliverable otherwise.
+func Unlink(spoolDir, id string) error {
 	act := filepath.Join(spoolDir, StateActive)
-	os.Remove(filepath.Join(act, "qf"+id))
-	os.Remove(filepath.Join(act, "df"+id))
+	if err := os.Remove(filepath.Join(act, "qf"+id)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(filepath.Join(act, "df"+id)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // Defer rewrites qf with new attempt state and moves both files to deferred/.
@@ -413,15 +421,25 @@ func Defer(spoolDir, id string, next time.Time, attempts int, lastErr string) er
 	return nil
 }
 
-// Bounce moves both files to bounce/.
-func Bounce(spoolDir, id string) {
+// Bounce moves both files to bounce/. df moves first, with rollback on a
+// failed qf rename, so a partial move never splits the pair or leaves the job
+// in active/ for another delivery attempt.
+func Bounce(spoolDir, id string) error {
 	act := filepath.Join(spoolDir, StateActive)
 	bnc := filepath.Join(spoolDir, StateBounce)
-	os.MkdirAll(bnc, 0700)
-	if err := os.Rename(filepath.Join(act, "df"+id), filepath.Join(bnc, "df"+id)); err != nil {
-		return
+	if err := os.MkdirAll(bnc, 0700); err != nil {
+		return err
 	}
-	os.Rename(filepath.Join(act, "qf"+id), filepath.Join(bnc, "qf"+id))
+	dfPath := filepath.Join(act, "df"+id)
+	bncDF := filepath.Join(bnc, "df"+id)
+	if err := os.Rename(dfPath, bncDF); err != nil {
+		return err
+	}
+	if err := os.Rename(filepath.Join(act, "qf"+id), filepath.Join(bnc, "qf"+id)); err != nil {
+		os.Rename(bncDF, dfPath)
+		return err
+	}
+	return nil
 }
 
 // RecoverActive moves active/ entries older than cutoff back to incoming/,
