@@ -369,6 +369,7 @@ Global option `smtp`, repeatable per port: `smtp :25 { ... }` and
 | `max_message_size` | 25 MiB | `552` past this |
 | `max_recipients` | 50 | `452` on the 51st `RCPT TO` |
 | `max_connections` | 200 | Concurrent connections |
+| `max_ip_clients` | 50 | Concurrent connections per remote IP; further ones get `421` |
 | `deliver_timeout` | 30s | Read/write deadline and idle cap |
 | `route` | none | Caddy route the parsed message is handed to |
 
@@ -437,7 +438,8 @@ makes the remote MTA retry.
 
 `caddy_email_smtp_connections_total` (connections accepted) and
 `caddy_email_smtp_messages_total` (messages accepted by the route, i.e. replied
-`250`), registered the same way as the `mta` metrics.
+`250`), plus `caddy_email_smtp_ip_rejections_total` (connections refused by the
+per-IP cap), registered the same way as the `mta` metrics.
 
 ---
 

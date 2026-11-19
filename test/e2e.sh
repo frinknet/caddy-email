@@ -14,6 +14,7 @@ cd "$ROOT"
 TMP=$(mktemp -d /tmp/caddy-email-e2e-XXXXXX)
 PORT=9099
 SMTP_PORT=9098
+PERIP_PORT=9097
 SLUG=$(sed -n '1s/^[^:]*: //p' ./NOTICE)
 IMAGE="${E2E_IMAGE:-${SLUG}:test}"
 CONTAINER_NAME="caddyemail-e2e-runner"
@@ -48,6 +49,14 @@ cat >"$TMP/Caddyfile" <<'CADDY'
 		route {
 			reverse_proxy 127.0.0.1:8080
 		}
+	}
+	# One slot per peer, so a second concurrent connection from the same
+	# address is refused instead of being accepted. Test 9 holds the slot with
+	# a slow upload and probes it from the host over a published port.
+	smtp :2526 {
+		hostname mail.test
+		tls off
+		max_ip_clients 1
 	}
 }
 
@@ -110,6 +119,7 @@ timeout 60s docker run -d \
 	-v "$TMP/Caddyfile:/etc/caddy/Caddyfile:ro" \
 	-p "127.0.0.1:$PORT:8081" \
 	-p "127.0.0.1:$SMTP_PORT:2525" \
+	-p "127.0.0.1:$PERIP_PORT:2526" \
 	"$IMAGE" run --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null
 
 echo "=== Waiting for Caddy ==="
@@ -408,6 +418,49 @@ elif printf '%s\n' "$STUB_OUT" | grep -q 'does not implement shared.Enqueuer'; t
 else
 	bad "startup fails with the enqueuer error" "got exit=$STUB_STATUS: $STUB_OUT"
 fi
+
+# ── Test 9: per-IP connection cap ──────────────────────
+echo ""
+echo "=== Test 9: per-IP connection cap ==="
+# The :2526 listener allows one connection per peer. Published-port traffic
+# from the host all arrives from the same peer address, so a slow upload holds
+# the only slot while a second connection must be refused with a retryable
+# 421. Closing the first connection must hand the slot back.
+dd if=/dev/zero of="$TMP/hold.eml" bs=1024 count=1024 2>/dev/null
+set +e
+curl -sS -v --max-time 18 --limit-rate 1k --url "smtp://127.0.0.1:$PERIP_PORT" \
+	--mail-from a@b --mail-rcpt c@d --upload-file "$TMP/hold.eml" >/dev/null 2>&1 &
+HOLD_PID=$!
+sleep 2
+PERIP_OUT=$(curl -sS -v --max-time 10 --url "smtp://127.0.0.1:$PERIP_PORT" \
+	--mail-from a@b --mail-rcpt c@d --upload-file "$TMP/control.eml" 2>&1)
+kill "$HOLD_PID" 2>/dev/null
+wait "$HOLD_PID" 2>/dev/null
+set -e
+check "second concurrent connection from one IP is refused" '^< 421 4\.7\.0' "$PERIP_OUT"
+if printf '%s\n' "$PERIP_OUT" | grep -q '^< 220 '; then
+	bad "refused connection never got a greeting"
+else
+	ok "refused connection never got a greeting"
+fi
+
+i=0
+PERIP_AFTER=
+while [ "$i" -lt 10 ]; do
+	PERIP_AFTER=$(curl -sS -v --max-time 5 --url "smtp://127.0.0.1:$PERIP_PORT" \
+		--mail-from a@b --mail-rcpt c@d --upload-file "$TMP/control.eml" 2>&1 || true)
+	printf '%s\n' "$PERIP_AFTER" | grep -q '^< 220 ' && break
+	sleep 1
+	i=$((i + 1))
+done
+check "slot is released once the held connection closes" '^< 220 ' "$PERIP_AFTER"
+
+set +e
+METRICS=$(curl -sf --max-time 10 "http://127.0.0.1:$PORT/metrics")
+METRICS_STATUS=$?
+set -e
+check_eq "GET /metrics succeeds after the per-IP probe" 0 "$METRICS_STATUS"
+check_eq "one per-IP rejection counted" 1 "$(metric_value caddy_email_smtp_ip_rejections_total)"
 
 # ── Summary ────────────────────────────────────────────
 echo ""

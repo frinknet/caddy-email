@@ -187,8 +187,9 @@ See the `Dockerfile` for the scratch image — ~5 MB binary, nothing but caddy,
 toybox, and a prayer. The image loads `/etc/caddy/Caddyfile`, which is the
 default config shipped in `www/`. To check a built image end to end, run
 `E2E_IMAGE=<image> sh test/e2e.sh`; it boots the image and exercises the SMTP
-route header allowlist, the sendmail handler, the metrics endpoint, and startup
-validation. It also needs the stub image (`<image>-stub`, override with
+route header allowlist, the sendmail handler, the metrics endpoint, the
+per-IP connection cap, and startup validation. It also needs the stub image
+(`<image>-stub`, override with
 `CADDY_EMAIL_STUB_IMAGE`) that `./build.sh` produces from
 `tests/e2e/stub.Dockerfile`; the script runs it to prove startup fails with an
 error, not a panic, when the `mta` app is not the bundled enqueuer. Run the
@@ -299,6 +300,7 @@ sendmail {
         max_message_size    26214400
         max_recipients      50
         max_connections     200
+        max_ip_clients      50
         deliver_timeout     30s
         route {
             reverse_proxy localhost:8080
@@ -316,6 +318,7 @@ sendmail {
 | `max_message_size` | 25 MiB | A `DATA` body past this is rejected with `552` |
 | `max_recipients` | 50 | The 51st `RCPT TO` is rejected with `452` |
 | `max_connections` | 200 | Concurrent connections; further clients wait |
+| `max_ip_clients` | 50 | Concurrent connections from one remote IP; further ones get `421` |
 | `deliver_timeout` | 30s | Read and write deadline, and the idle-session cap |
 | `route` | none | Caddy route the parsed message is handed to |
 
@@ -327,6 +330,13 @@ authentication, and no relay policy. `route` is optional, and a listener without
 one accepts every message with `250`. Relaying, sender filtering, and recipient
 filtering are all decisions for the route, which is what the port 25 relay
 example above does with a `remote_ip` matcher.
+
+`max_ip_clients` keeps one peer from occupying every listener slot: the 51st
+concurrent connection from a single address is refused with `421 4.7.0` and
+closed immediately, and each refusal is counted by
+`caddy_email_smtp_ip_rejections_total`. It counts concurrency, not rate, so a
+peer that connects and disconnects quickly is still bounded by how fast slots
+free up. Raise it for a bulk sender that legitimately opens many connections.
 
 ### What the route handler sees
 
@@ -632,6 +642,7 @@ If you run `admin off`, mount Caddy's `metrics` handler on a route instead:
 | `caddy_email_mta_spool_bytes` | gauge | | Bytes held by the spool directory |
 | `caddy_email_mta_spool_jobs` | gauge | `state` (`incoming`, `active`, `deferred`, `bounce`, `corrupt`) | Queued jobs by spool state |
 | `caddy_email_smtp_connections_total` | counter | | Inbound SMTP connections accepted |
+| `caddy_email_smtp_ip_rejections_total` | counter | | Connections refused by the per-IP connection cap |
 | `caddy_email_smtp_messages_total` | counter | | Inbound messages accepted by the route |
 | `caddy_email_sendmail_enqueued_total` | counter | | Messages accepted by the sendmail HTTP API |
 

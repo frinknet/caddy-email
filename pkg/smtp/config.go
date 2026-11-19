@@ -16,8 +16,21 @@ func init() {
 	httpcaddyfile.RegisterGlobalOption("smtp", parseSMTPOption)
 }
 
-func parseSMTPOption(d *caddyfile.Dispenser, _ any) (any, error) {
-	app := new(SMTP)
+func parseSMTPOption(d *caddyfile.Dispenser, existing any) (any, error) {
+	// Caddy keeps one value per global option, so a repeated `smtp` block
+	// would overwrite the earlier one. Fold the listeners together instead.
+	payload := struct {
+		Listeners []json.RawMessage `json:"listeners,omitempty"`
+	}{}
+	if prev, ok := existing.(httpcaddyfile.App); ok && prev.Name == "smtp" {
+		var prior struct {
+			Listeners []json.RawMessage `json:"listeners"`
+		}
+		if err := json.Unmarshal(prev.Value, &prior); err != nil {
+			return nil, d.Errf("smtp: %v", err)
+		}
+		payload.Listeners = prior.Listeners
+	}
 	for d.Next() {
 		lc := &ListenerConfig{Port: 25}
 		if d.NextArg() {
@@ -61,6 +74,15 @@ func parseSMTPOption(d *caddyfile.Dispenser, _ any) (any, error) {
 					return nil, err
 				}
 				lc.MaxConnections = n
+			case "max_ip_clients":
+				if !d.NextArg() {
+					return nil, d.ArgErr()
+				}
+				n, err := strconv.Atoi(d.Val())
+				if err != nil {
+					return nil, err
+				}
+				lc.MaxIPClients = n
 			case "deliver_timeout":
 				if !d.NextArg() {
 					return nil, d.ArgErr()
@@ -92,9 +114,13 @@ func parseSMTPOption(d *caddyfile.Dispenser, _ any) (any, error) {
 				return nil, d.Errf("unknown smtp option: %s", d.Val())
 			}
 		}
-		app.Listeners = append(app.Listeners, lc)
+		raw, err := json.Marshal(lc)
+		if err != nil {
+			return nil, err
+		}
+		payload.Listeners = append(payload.Listeners, raw)
 	}
-	value, err := json.Marshal(app)
+	value, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}

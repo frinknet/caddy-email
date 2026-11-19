@@ -40,6 +40,7 @@ type ListenerConfig struct {
 	MaxMessageSize int64               `json:"max_message_size,omitempty"`
 	MaxRecipients  int                 `json:"max_recipients,omitempty"`
 	MaxConnections int                 `json:"max_connections,omitempty"`
+	MaxIPClients   int                 `json:"max_ip_clients,omitempty"`
 	DeliverTimeout caddy.Duration      `json:"deliver_timeout,omitempty"`
 	TLS            string              `json:"tls,omitempty"` // "starttls" | "off"
 	TLSCertFile    string              `json:"tls_cert_file,omitempty"`
@@ -75,6 +76,9 @@ func (s *SMTP) Provision(ctx caddy.Context) error {
 		if lc.MaxConnections == 0 {
 			lc.MaxConnections = 200
 		}
+		if lc.MaxIPClients == 0 {
+			lc.MaxIPClients = 50
+		}
 		if lc.DeliverTimeout == 0 {
 			lc.DeliverTimeout = caddy.Duration(30 * time.Second)
 		}
@@ -108,6 +112,9 @@ func (s *SMTP) Validate() error {
 		}
 		if lc.MaxConnections < 0 {
 			return fmt.Errorf("smtp :%d max_connections must be >= 0", lc.Port)
+		}
+		if lc.MaxIPClients < 0 {
+			return fmt.Errorf("smtp :%d max_ip_clients must be >= 0", lc.Port)
 		}
 		if lc.MaxMessageSize < 0 {
 			return fmt.Errorf("smtp :%d max_message_size must be >= 0", lc.Port)
@@ -165,6 +172,7 @@ func (s *SMTP) Stop() error {
 func (s *SMTP) serve(lc *ListenerConfig, ln net.Listener) {
 	defer s.wg.Done()
 	sem := make(chan struct{}, lc.MaxConnections)
+	perIP := newIPLimiter(lc.MaxIPClients)
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -175,12 +183,23 @@ func (s *SMTP) serve(lc *ListenerConfig, ln net.Listener) {
 				continue
 			}
 		}
+		ip := remoteIP(conn.RemoteAddr())
+		if perIP != nil && !perIP.acquire(ip) {
+			metricIPRejections.Inc()
+			s.log.Warn("smtp: per-IP connection limit reached",
+				zap.String("ip", ip), zap.Int("max_ip_clients", lc.MaxIPClients))
+			rejectTooManyConnections(lc, conn)
+			continue
+		}
 		metricConnections.Inc()
 		sem <- struct{}{}
-		go func(c net.Conn) {
+		go func(c net.Conn, ip string) {
 			defer func() { <-sem }()
 			defer c.Close()
+			if perIP != nil {
+				defer perIP.release(ip)
+			}
 			newSession(lc, c).run()
-		}(conn)
+		}(conn, ip)
 	}
 }

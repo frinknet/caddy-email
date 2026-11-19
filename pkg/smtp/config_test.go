@@ -69,3 +69,94 @@ func TestCaddyfileRouteParsed(t *testing.T) {
 		t.Error("first route has no handlers")
 	}
 }
+
+// TestCaddyfileMaxIPClientsParsed guards the documented `max_ip_clients`
+// option: dropping it in the adapter would silently fall back to the default
+// cap and let one peer take every listener slot.
+func TestCaddyfileMaxIPClientsParsed(t *testing.T) {
+	t.Parallel()
+	src := []byte(`{
+    smtp :2525 {
+        max_ip_clients 7
+    }
+}
+`)
+	adapter := caddyconfig.GetAdapter("caddyfile")
+	if adapter == nil {
+		t.Fatal("caddyfile adapter not registered")
+	}
+	adapted, _, err := adapter.Adapt(caddyfile.Format(src), nil)
+	if err != nil {
+		t.Fatalf("adapt: %v", err)
+	}
+
+	var cfg struct {
+		Apps struct {
+			SMTP struct {
+				Listeners []struct {
+					MaxIPClients int `json:"max_ip_clients"`
+				} `json:"listeners"`
+			} `json:"smtp"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(adapted, &cfg); err != nil {
+		t.Fatalf("decode adapted config: %v", err)
+	}
+	if n := len(cfg.Apps.SMTP.Listeners); n != 1 {
+		t.Fatalf("listeners = %d, want 1", n)
+	}
+	if got := cfg.Apps.SMTP.Listeners[0].MaxIPClients; got != 7 {
+		t.Fatalf("max_ip_clients = %d, want 7", got)
+	}
+}
+
+// TestCaddyfileRepeatedSMTPBlocksKeepBothListeners guards the README promise
+// that the block is repeatable: Caddy stores one value per global option, so
+// the adapter must merge listeners across occurrences instead of letting the
+// last block replace the first.
+func TestCaddyfileRepeatedSMTPBlocksKeepBothListeners(t *testing.T) {
+	t.Parallel()
+	src := []byte(`{
+    smtp :2525 {
+        hostname mail.test
+    }
+    smtp :2526 {
+        max_ip_clients 7
+    }
+}
+`)
+	adapter := caddyconfig.GetAdapter("caddyfile")
+	if adapter == nil {
+		t.Fatal("caddyfile adapter not registered")
+	}
+	adapted, _, err := adapter.Adapt(caddyfile.Format(src), nil)
+	if err != nil {
+		t.Fatalf("adapt: %v", err)
+	}
+
+	var cfg struct {
+		Apps struct {
+			SMTP struct {
+				Listeners []struct {
+					Port         int `json:"port"`
+					MaxIPClients int `json:"max_ip_clients"`
+				} `json:"listeners"`
+			} `json:"smtp"`
+		} `json:"apps"`
+	}
+	if err := json.Unmarshal(adapted, &cfg); err != nil {
+		t.Fatalf("decode adapted config: %v", err)
+	}
+	if n := len(cfg.Apps.SMTP.Listeners); n != 2 {
+		t.Fatalf("listeners = %d, want 2", n)
+	}
+	if got := cfg.Apps.SMTP.Listeners[0].Port; got != 2525 {
+		t.Fatalf("first listener port = %d, want 2525", got)
+	}
+	if got := cfg.Apps.SMTP.Listeners[1].Port; got != 2526 {
+		t.Fatalf("second listener port = %d, want 2526", got)
+	}
+	if got := cfg.Apps.SMTP.Listeners[1].MaxIPClients; got != 7 {
+		t.Fatalf("second listener max_ip_clients = %d, want 7", got)
+	}
+}
